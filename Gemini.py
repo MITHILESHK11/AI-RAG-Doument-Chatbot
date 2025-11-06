@@ -16,8 +16,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from langchain.schema import HumanMessage
-
+from langchain_core.messages import HumanMessage
 # ---- Streamlit UI setup ----
 st.set_page_config(page_title="AI Document Chatbot", page_icon="📚", layout="wide")
 
@@ -325,3 +324,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
