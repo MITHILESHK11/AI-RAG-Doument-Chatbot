@@ -3,7 +3,7 @@ import os
 import re
 import requests
 from bs4 import BeautifulSoup
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
@@ -393,3 +393,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
