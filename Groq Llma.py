@@ -11,12 +11,12 @@ import pandas as pd
 import uuid
 
 # ✅ Modern LangChain 2025+ Imports (no deprecated paths)
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # ✅ Correct replacement
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
+
 
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="AI Document Chatbot", page_icon="📚", layout="wide")
@@ -124,30 +124,48 @@ def get_vector_store(chunks, meta):
 
 
 # -------------------- Chain Builders --------------------
-def get_qa_chain():
-    """Groq LLaMA QA chain with custom prompt."""
+def get_answer_from_docs(docs, question):
+    """Use ChatGroq directly for QA without deprecated chains."""
+    context = "\n\n".join(
+        f"(Doc ID: {d.metadata.get('doc_id')}, Page: {d.metadata.get('page')}, Paragraph: {d.metadata.get('paragraph')}, Source: {d.metadata.get('source')})\n{d.page_content}"
+        for d in docs
+    )
+
     prompt_text = """
-    You are a disciplined QA agent.  
-    Use only the given context to answer the question in concise bullet points.  
-    Cite each claim as (Document ID:[ID], Page:[X], Paragraph:[Y], Source:[S]).  
-    If answer not found, reply exactly: "Answer is not available in the context."
+    You are a disciplined QA agent.
+    Use only the given context to answer the question in concise bullet points.
+    Cite each claim as (Document ID:[ID], Page:[X], Paragraph:[Y], Source:[S]).
+    If the answer is not found, reply exactly: "Answer is not available in the context."
     Context:\n{context}\nQuestion:\n{question}\nAnswer:
     """
+
+    prompt = PromptTemplate.from_template(prompt_text)
     model = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_text, input_variables=["context", "question"])
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    formatted = prompt.format(context=context, question=question)
+    result = model.invoke(formatted)
+    return result.content if hasattr(result, "content") else str(result)
 
 
-def get_theme_chain():
-    """Groq LLaMA theme summarizer."""
-    template = """
-    Summarize recurring themes related to the question below from the provided context.  
+def get_theme_summary(docs, question):
+    """Summarize recurring themes using ChatGroq directly."""
+    context = "\n\n".join(
+        f"(Doc ID: {d.metadata.get('doc_id')}, Page: {d.metadata.get('page')}, Paragraph: {d.metadata.get('paragraph')}, Source: {d.metadata.get('source')})\n{d.page_content}"
+        for d in docs
+    )
+
+    prompt_text = """
+    Summarize recurring themes related to the question below from the provided context.
     Use bullet points with citations (Document ID:[ID], Page:[X], Paragraph:[Y], Source:[S]).
     Context:\n{context}\nQuestion:\n{question}\nSummary:
     """
+
+    prompt = PromptTemplate.from_template(prompt_text)
     model = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.5)
-    prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    formatted = prompt.format(context=context, question=question)
+    result = model.invoke(formatted)
+    return result.content if hasattr(result, "content") else str(result)
 
 
 # -------------------- UI Logic --------------------
@@ -191,10 +209,9 @@ if submit:
                 db = FAISS.load_local("faiss_index", embed, allow_dangerous_deserialization=True)
                 docs = db.similarity_search(user_q, k=5)
 
-                qa_chain = get_qa_chain()
-                ans = qa_chain({"input_documents": docs, "question": user_q}, return_only_outputs=True)
                 st.subheader("Answer")
-                st.markdown(ans["output_text"])
+                response_text = get_answer_from_docs(docs, user_q)
+                st.markdown(response_text)
 
                 st.subheader("Citations")
                 df = pd.DataFrame(
@@ -212,9 +229,8 @@ if submit:
                 st.markdown(df.to_html(index=False, classes="answer-table", escape=False), unsafe_allow_html=True)
 
                 st.subheader("Recurring Themes")
-                theme_chain = get_theme_chain()
-                theme = theme_chain({"input_documents": docs, "question": user_q}, return_only_outputs=True)
-                st.markdown(theme["output_text"])
+                theme_text = get_theme_summary(docs, user_q)
+                st.markdown(theme_text)
 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -225,14 +241,8 @@ st.markdown(
     """
     <div class="text-center text-gray-500 mt-8">
         <hr class="border-gray-200 mb-4">
-        <p>Powered by LangChain Community, Groq LLaMA 3.3 & FAISS</p>
+        <p>Powered by LangChain HuggingFace, Groq LLaMA 3.3 & FAISS</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
-
-
-
-
-
-
