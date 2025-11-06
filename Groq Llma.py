@@ -1,6 +1,9 @@
 # ==============================================================================
-# ENTERPRISE PDF → KNOWLEDGE: Enhanced Streamlit Application
-# Full-featured application with interactive UI, analytics, and advanced features
+# ENTERPRISE PDF → KNOWLEDGE: Advanced Edition with Enhanced Features
+# - Document-specific search/RAG selection
+# - Advanced image extraction with LLM labeling & context awareness
+# - Deep detailed extraction for both scanned & digital PDFs
+# - Improved OCR and context understanding
 # ==============================================================================
 
 import streamlit as st
@@ -9,14 +12,13 @@ import re
 import json
 import time
 import traceback
-import hashlib
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import zipfile
 
-# Extraction libs
+# Extraction
 import pdfplumber
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
@@ -26,7 +28,6 @@ import cv2
 import numpy as np
 from bs4 import BeautifulSoup
 
-# ML / LLM / embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -37,9 +38,7 @@ import pandas as pd
 import uuid
 import logging
 
-# ==============================================================================
-# CONFIGURATION & PATHS
-# ==============================================================================
+# ==== CONFIG & PATHS ====
 BASE = Path.cwd()
 DATA_DIR = BASE / "data"
 DOCS_DIR = DATA_DIR / "docs"
@@ -49,143 +48,85 @@ METADATA_FILE = DATA_DIR / "metadata.json"
 FAISS_DIR = DATA_DIR / "faiss_index"
 AUDIT_LOG = DATA_DIR / "audit.log"
 METRICS_FILE = DATA_DIR / "metrics.json"
+IMAGE_METADATA_FILE = DATA_DIR / "image_metadata.json"
 
 for d in (DATA_DIR, DOCS_DIR, TABLES_DIR, IMAGES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Logging configuration
 logger = logging.getLogger("pdf_ingest")
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler(AUDIT_LOG)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-# Streamlit page config
-st.set_page_config(
-    page_title="📚 Enterprise PDF → Knowledge",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Enterprise PDF → Knowledge Pro", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS for enhanced UI
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        margin-bottom: 1rem;
-    }
-    .card {
-        background-color: #f0f2f6;
-        padding: 1.5rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-        margin-bottom: 1rem;
-    }
-    .metric {
-        text-align: center;
-        padding: 1rem;
-        background: white;
-        border-radius: 0.5rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }
-    .status-badge {
-        display: inline-block;
-        padding: 0.5rem 1rem;
-        border-radius: 1rem;
-        font-size: 0.9rem;
-        font-weight: bold;
-        margin: 0.25rem;
-    }
-    .status-success { background-color: #d4edda; color: #155724; }
-    .status-warning { background-color: #fff3cd; color: #856404; }
-    .status-error { background-color: #f8d7da; color: #721c24; }
-    .section-title {
-        font-size: 1.8rem;
-        font-weight: bold;
-        color: #1f77b4;
-        margin: 1.5rem 0 1rem 0;
-        border-bottom: 2px solid #1f77b4;
-        padding-bottom: 0.5rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ==============================================================================
-# SESSION STATE & AUTHENTICATION
-# ==============================================================================
+# ==== ROLE SELECTION (CORRECTED) ====
 if 'user_role' not in st.session_state:
-    st.session_state.user_role = 'viewer'  # viewer, editor, admin
+    st.session_state.user_role = 'viewer'
+role_options = ["viewer", "editor", "admin"]
+selected_role = st.sidebar.selectbox("Role:", role_options, index=role_options.index(st.session_state.user_role))
+st.session_state.user_role = selected_role
+st.sidebar.write(f"Status: {st.session_state.user_role.upper()}")
 
-if 'search_results' not in st.session_state:
-    st.session_state.search_results = []
+def check_permission(required_role: str) -> bool:
+    roles = {'viewer': 1, 'editor': 2, 'admin': 3}
+    return roles.get(st.session_state.user_role, 0) >= roles.get(required_role, 0)
 
-if 'selected_doc' not in st.session_state:
-    st.session_state.selected_doc = None
-
-# ==============================================================================
-# HELPER FUNCTIONS
-# ==============================================================================
-
+# ==== HELPER FUNCTIONS ====
 def load_metadata() -> Dict:
-    """Load metadata from JSON file."""
     if METADATA_FILE.exists():
-        try:
-            return json.loads(METADATA_FILE.read_text(encoding="utf8"))
-        except Exception as e:
-            logger.error(f"Failed to load metadata: {e}")
-            return {}
+        try: return json.loads(METADATA_FILE.read_text(encoding="utf8"))
+        except: return {}
     return {}
 
 def save_metadata(meta: Dict):
-    """Save metadata to JSON file."""
-    try:
-        METADATA_FILE.write_text(json.dumps(meta, indent=2), encoding="utf8")
-    except Exception as e:
-        logger.error(f"Failed to save metadata: {e}")
+    METADATA_FILE.write_text(json.dumps(meta, indent=2), encoding="utf8")
 
-def load_metrics() -> Dict:
-    """Load performance metrics."""
-    if METRICS_FILE.exists():
-        try:
-            return json.loads(METRICS_FILE.read_text(encoding="utf8"))
-        except Exception:
-            return {"total_docs": 0, "total_tables": 0, "total_images": 0, "avg_extraction_time": 0}
-    return {"total_docs": 0, "total_tables": 0, "total_images": 0, "avg_extraction_time": 0}
+def load_image_metadata() -> Dict:
+    if IMAGE_METADATA_FILE.exists():
+        try: return json.loads(IMAGE_METADATA_FILE.read_text(encoding="utf8"))
+        except: return {}
+    return {}
 
-def save_metrics(metrics: Dict):
-    """Save performance metrics."""
-    try:
-        METRICS_FILE.write_text(json.dumps(metrics, indent=2), encoding="utf8")
-    except Exception as e:
-        logger.error(f"Failed to save metrics: {e}")
-
-def make_doc_id() -> str:
-    """Generate unique document ID."""
-    return str(uuid.uuid4())[:12]
-
-def safe_text(s: Optional[str]) -> str:
-    """Sanitize text by removing invalid Unicode characters."""
-    if not s:
-        return ""
-    return re.sub(r'[\ud800-\udfff]', '', s)
+def save_image_metadata(meta: Dict):
+    IMAGE_METADATA_FILE.write_text(json.dumps(meta, indent=2), encoding="utf8")
 
 def audit_log(action: str, details: str = ""):
-    """Log user actions for audit trail."""
     timestamp = datetime.now().isoformat()
     logger.info(f"ACTION: {action} | ROLE: {st.session_state.user_role} | DETAILS: {details}")
 
-def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """Preprocess image for improved OCR accuracy."""
+def make_doc_id() -> str:
+    return str(uuid.uuid4())[:12]
+
+def safe_text(s: Optional[str]) -> str:
+    return re.sub(r'[\ud800-\udfff]', '', s) if s else ""
+
+# ==== ADVANCED IMAGE PREPROCESSING ====
+def preprocess_image_for_ocr(pil_img: Image.Image, enhancement_level: int = 2) -> Image.Image:
+    """Advanced preprocessing for scanned & low-quality images"""
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    # Convert to grayscale
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 11)
+    
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+    
+    # Multi-level noise reduction
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    gray = cv2.medianBlur(gray, 5)
+    
+    # Advanced thresholding
+    if enhancement_level >= 2:
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
+    else:
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Deskewing
     coords = np.column_stack(np.where(th > 0))
-    if coords.size:
+    if coords.size > 100:
         angle = cv2.minAreaRect(coords)[-1]
         if angle < -45:
             angle = -(90 + angle)
@@ -195,72 +136,105 @@ def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
             (h, w) = th.shape
             center = (w // 2, h // 2)
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            th = cv2.warpAffine(th, M, (w, h),
-                                flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    pil_res = Image.fromarray(th)
-    return pil_res
+            th = cv2.warpAffine(th, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    # Morphological operations to clean up
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    
+    return Image.fromarray(th)
 
-def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[List[str], List[Dict]]:
-    """Extract text from PDF with OCR fallback for scanned pages."""
-    pages = []
-    toc = []
+def is_scanned_pdf(file_bytes: bytes) -> bool:
+    """Detect if PDF is scanned (image-based) vs digital text"""
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            text_pages = 0
             for page in pdf.pages:
                 txt = page.extract_text() or ""
-                txt = safe_text(txt)
-                pages.append(txt)
-        try:
-            reader = PdfReader(BytesIO(file_bytes))
-            try:
-                outline = reader.outline
-                toc = []
-                for item in outline:
-                    try:
-                        title = getattr(item, "title", str(item))
-                        toc.append(str(title))
-                    except Exception:
-                        continue
-            except Exception:
-                toc = []
-        except Exception:
-            toc = []
-    except Exception:
-        try:
-            reader = PdfReader(BytesIO(file_bytes))
-            pages = []
-            for page in reader.pages:
-                txt = page.extract_text() or ""
-                pages.append(safe_text(txt))
-        except Exception:
-            pages = []
+                if len(txt.strip()) > 50:
+                    text_pages += 1
+            scanned_ratio = (len(pdf.pages) - text_pages) / len(pdf.pages)
+            return scanned_ratio > 0.3
+    except:
+        return True
 
-    # OCR fallback for empty pages
-    if use_ocr_if_empty and any(not p.strip() for p in pages):
+# ==== ADVANCED TEXT EXTRACTION WITH CONTEXT ====
+def extract_text_pdf_advanced(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Advanced extraction returning detailed page data with:
+    - Page type (digital/scanned)
+    - Text position
+    - Surrounding text for images
+    """
+    pages_data = []
+    toc = []
+    is_scanned = is_scanned_pdf(file_bytes)
+    
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                txt = page.extract_text() or ""
+                txt = safe_text(txt)
+                
+                # Extract detailed page info
+                page_info = {
+                    "page_num": page_num,
+                    "text": txt,
+                    "is_scanned": is_scanned if not txt.strip() else False,
+                    "text_objects": page.extract_text_lines() if hasattr(page, 'extract_text_lines') else [],
+                    "char_count": len(txt),
+                    "word_count": len(txt.split()),
+                }
+                pages_data.append(page_info)
+        
+        # Extract TOC
+        try:
+            reader = PdfReader(BytesIO(file_bytes))
+            toc = []
+            for item in getattr(reader, "outline", []):
+                try:
+                    title = str(getattr(item, "title", item))
+                    toc.append(title)
+                except:
+                    continue
+        except:
+            toc = []
+    except Exception as e:
+        logger.error(f"Primary PDF extraction failed: {e}")
+    
+    # OCR fallback for scanned pages
+    if use_ocr_if_empty and any(not p["text"].strip() for p in pages_data):
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for i in range(len(doc)):
-                if pages and pages[i].strip():
+            for i, page_data in enumerate(pages_data):
+                if page_data["text"].strip():
                     continue
+                
                 page = doc.load_page(i)
-                zoom = 2
+                zoom = 3  # Higher resolution for better OCR
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                pre = preprocess_image_for_ocr(img)
+                pre = preprocess_image_for_ocr(img, enhancement_level=2)
+                
                 try:
                     ocr_text = pytesseract.image_to_string(pre, lang='eng')
+                    page_data["text"] = safe_text(ocr_text)
+                    page_data["is_scanned"] = True
                 except pytesseract.pytesseract.TesseractNotFoundError:
-                    ocr_text = ""
-                pages[i] = safe_text(ocr_text)
-        except Exception:
-            pass
-
-    cleaned_pages = [postprocess_extracted_text(p) for p in pages]
-    return cleaned_pages, toc
+                    page_data["text"] = ""
+        except Exception as e:
+            logger.warning(f"OCR fallback failed: {e}")
+    
+    # Clean and postprocess all text
+    cleaned_data = []
+    for page_data in pages_data:
+        page_data["text"] = postprocess_extracted_text(page_data["text"])
+        cleaned_data.append(page_data)
+    
+    return cleaned_data, toc
 
 def dehyphenate(text: str) -> str:
-    """Remove hyphenation artifacts from extracted text."""
     text = re.sub(r'-\s*\n\s*', '', text)
     text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
     text = re.sub(r'\n{2,}', '\n\n', text)
@@ -268,7 +242,6 @@ def dehyphenate(text: str) -> str:
     return text.strip()
 
 def postprocess_extracted_text(text: str) -> str:
-    """Clean and format extracted text."""
     if not text:
         return ""
     text = text.replace('\r', '\n')
@@ -277,7 +250,6 @@ def postprocess_extracted_text(text: str) -> str:
     return text
 
 def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
-    """Extract tables from PDF using pdfplumber."""
     tables_all = []
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
@@ -296,46 +268,106 @@ def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
                                 rowd[str(key or j)] = safe_text(cell)
                             rows.append(rowd)
                         tables_all.append({"page": i, "header": header, "rows": rows})
-                except Exception:
+                except:
                     continue
-    except Exception:
+    except:
         pass
     return tables_all
 
-def extract_images_pdf(file_bytes: bytes, doc_id: str) -> List[Dict]:
-    """Extract images from PDF with OCR captions."""
+# ==== ADVANCED IMAGE EXTRACTION WITH CONTEXT & LLM LABELING ====
+def extract_images_pdf_with_context(file_bytes: bytes, doc_id: str, groq_api_key: str = None) -> List[Dict]:
+    """
+    Extract images with:
+    - Surrounding text context
+    - LLM-generated intelligent labels
+    - Page content analysis
+    """
     imgs = []
+    page_texts = {}
+    
+    try:
+        # First, get all page texts for context
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                page_texts[page_num] = page.extract_text() or ""
+    except:
+        pass
+    
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         for page_i in range(len(doc)):
             page = doc[page_i]
             image_list = page.get_images(full=True)
+            
             for img_index, img in enumerate(image_list):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                ext = base_image.get("ext", "png")
-                img_name = f"{doc_id}_p{page_i+1}_img{img_index}.{ext}"
-                p = IMAGES_DIR / img_name
-                p.write_bytes(image_bytes)
                 try:
-                    pil = Image.open(BytesIO(image_bytes)).convert("RGB")
-                    caption = pytesseract.image_to_string(preprocess_image_for_ocr(pil), lang='eng').strip()
-                    if not caption:
-                        caption = "Image (no OCR text) — visual content"
-                except Exception:
-                    caption = "Image (unable to OCR)"
-                imgs.append({"file": str(p), "page": page_i + 1, "caption": caption, "id": f"img_{doc_id}_{img_index}"})
-    except Exception:
-        pass
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    ext = base_image.get("ext", "png")
+                    img_name = f"{doc_id}_p{page_i+1}_img{img_index}.{ext}"
+                    img_path = IMAGES_DIR / img_name
+                    img_path.write_bytes(image_bytes)
+                    
+                    # Get surrounding context text
+                    page_context = page_texts.get(page_i, "")
+                    
+                    # Generate OCR-based caption
+                    try:
+                        pil = Image.open(BytesIO(image_bytes)).convert("RGB")
+                        ocr_caption = pytesseract.image_to_string(preprocess_image_for_ocr(pil), lang='eng').strip()
+                        if not ocr_caption:
+                            ocr_caption = "(Image - no OCR text detected)"
+                    except:
+                        ocr_caption = "(OCR unavailable)"
+                    
+                    # Generate LLM label (intelligent description)
+                    llm_label = ""
+                    if groq_api_key and ocr_caption and ocr_caption != "(Image - no OCR text detected)":
+                        try:
+                            llm_label = generate_image_label(ocr_caption, page_context, groq_api_key)
+                        except Exception as e:
+                            logger.warning(f"LLM labeling failed: {e}")
+                            llm_label = f"Image context: {page_context[:100]}..."
+                    
+                    imgs.append({
+                        "file": str(img_path),
+                        "page": page_i + 1,
+                        "ocr_caption": ocr_caption,
+                        "llm_label": llm_label,
+                        "context": page_context[:200] if page_context else "(No surrounding text)",
+                        "id": f"img_{doc_id}_{img_index}"
+                    })
+                except Exception as e:
+                    logger.error(f"Error processing image {img_index}: {e}")
+                    continue
+    except Exception as e:
+        logger.error(f"Image extraction failed: {e}")
+    
     return imgs
 
+def generate_image_label(ocr_text: str, context: str, groq_api_key: str) -> str:
+    """Use LLM to generate intelligent image labels"""
+    prompt = f"""Based on the OCR text from an image and its surrounding context, 
+    provide a concise 1-2 sentence label describing what this image likely depicts:
+    
+    OCR Text: {ocr_text[:300]}
+    Context: {context[:300]}
+    
+    Label:"""
+    
+    try:
+        model = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.3, api_key=groq_api_key)
+        res = model.invoke(prompt)
+        return res.content[:200] if hasattr(res, 'content') else str(res)[:200]
+    except:
+        return f"Image with text: {ocr_text[:50]}..."
+
 def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
-    """Detect headings in extracted text."""
     headings = []
     lines = page_text.splitlines()
     pos = 0
-    for i, line in enumerate(lines):
+    for line in lines:
         s = line.strip()
         if not s:
             pos += len(line) + 1
@@ -347,11 +379,19 @@ def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
         pos += len(line) + 1
     return headings
 
-def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], List[Dict]]:
-    """Chunk document pages with metadata."""
-    page_marker_texts = [f"[Page {i+1}]\n{p}" for i, p in enumerate(pages)]
+def chunk_document_pages_advanced(pages_data: List[Dict], doc_meta: Dict) -> Tuple[List[str], List[Dict]]:
+    """Advanced chunking preserving page context and scanned vs digital info"""
+    page_marker_texts = []
+    for page_data in pages_data:
+        page_num = page_data["page_num"]
+        text = page_data["text"]
+        is_scanned = page_data.get("is_scanned", False)
+        marker = f"[Page {page_num}{'_SCANNED' if is_scanned else ''}]\n{text}"
+        page_marker_texts.append(marker)
+    
     full_text = "\n\n".join(page_marker_texts)
     headings = detect_headings_in_page(full_text)
+    
     chunks = []
     if headings:
         sections = re.split(r'\n\s*\n', full_text)
@@ -361,15 +401,22 @@ def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], L
                 chunks.append(sec)
     else:
         chunks = [s.strip() for s in re.split(r'\n\s*\n', full_text) if s.strip()]
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
+    
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     final_chunks = []
     metadatas = []
+    
     for i, c in enumerate(chunks):
-        if len(c) < 1200:
+        if len(c) < 1500:
             final_chunks.append(c)
-            md = {"doc_id": doc_meta["doc_id"], "page": None, "paragraph": i+1, "source": doc_meta["file_name"]}
-            m = re.search(r'\[Page (\d+)\]', c)
+            md = {
+                "doc_id": doc_meta["doc_id"],
+                "page": None,
+                "paragraph": i+1,
+                "source": doc_meta["file_name"],
+                "is_scanned": "SCANNED" in c
+            }
+            m = re.search(r'\[Page (\d+)', c)
             if m:
                 md["page"] = int(m.group(1))
             metadatas.append(md)
@@ -377,17 +424,23 @@ def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], L
             sub = splitter.split_text(c)
             for j, s in enumerate(sub):
                 final_chunks.append(s)
-                md = {"doc_id": doc_meta["doc_id"], "page": None, "paragraph": i+1, "source": doc_meta["file_name"]}
-                m = re.search(r'\[Page (\d+)\]', s)
+                md = {
+                    "doc_id": doc_meta["doc_id"],
+                    "page": None,
+                    "paragraph": i+1,
+                    "source": doc_meta["file_name"],
+                    "is_scanned": "SCANNED" in s
+                }
+                m = re.search(r'\[Page (\d+)', s)
                 if m:
                     md["page"] = int(m.group(1))
                 metadatas.append(md)
+    
     return final_chunks, metadatas
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 def build_or_load_faiss(chunks: List[str], metadatas: List[Dict]):
-    """Build or load FAISS vector index."""
     embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     try:
         if FAISS_DIR.exists() and any(FAISS_DIR.iterdir()):
@@ -396,25 +449,26 @@ def build_or_load_faiss(chunks: List[str], metadatas: List[Dict]):
                 db.add_texts(chunks, metadatas=metadatas)
                 try:
                     db.save_local(str(FAISS_DIR))
-                except Exception:
+                except:
                     pass
             return db
-    except Exception:
+    except:
         pass
+    
     if not chunks:
         chunks = [""]
-        metadatas = [{"doc_id":"dummy","page":0,"paragraph":0,"source":"none"}]
+        metadatas = [{"doc_id":"dummy","page":0,"paragraph":0,"source":"none","is_scanned":False}]
+    
     db = FAISS.from_texts(chunks, embedding=embed, metadatas=metadatas)
     try:
         db.save_local(str(FAISS_DIR))
-    except Exception:
+    except:
         pass
     return db
 
 QA_PROMPT = """You are an accurate document question-answering assistant.
-Use ONLY the provided context to answer the question. Provide bullet points and cite every claim as:
-(Document ID: [ID], Page: [X], Paragraph: [Y], Source: [Source]).
-If the answer cannot be found in the context, respond EXACTLY: "Answer is not available in the context."
+Use ONLY the provided context to answer the question. Provide clear, detailed answers with citations:
+(Document: [SOURCE], Page: [PAGE], Context: [TYPE])
 
 Context:
 {context}
@@ -425,18 +479,31 @@ Question:
 Answer:
 """
 
-def ask_groq_with_docs(docs, question, model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=None):
-    """Get answer from Groq LLM with document context."""
+def ask_groq_with_docs(docs, question, doc_filter=None, model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=None):
+    """Get answer with optional document filtering"""
     parts = []
-    for d in docs:
+    filtered_docs = []
+    
+    # Filter by document if specified
+    if doc_filter and doc_filter != "All Documents":
+        filtered_docs = [d for d in docs if d.metadata.get('source', '') == doc_filter]
+        if not filtered_docs:
+            filtered_docs = docs
+    else:
+        filtered_docs = docs
+    
+    for d in filtered_docs:
         content = getattr(d, "page_content", d.get("page_content") if isinstance(d, dict) else str(d))
         meta = getattr(d, "metadata", d.get("metadata") if isinstance(d, dict) else {})
-        header = f"(Document ID: {meta.get('doc_id','NA')}, Page: {meta.get('page','NA')}, Paragraph: {meta.get('paragraph','NA')}, Source: {meta.get('source','NA')})"
+        doc_type = "Scanned" if meta.get("is_scanned") else "Digital"
+        header = f"(Document: {meta.get('source','NA')}, Page: {meta.get('page','NA')}, Type: {doc_type})"
         snippet = content if len(content) < 2000 else content[:1900] + "..."
         parts.append(header + "\n" + snippet)
+    
     context = "\n\n---\n\n".join(parts)
     prompt = PromptTemplate.from_template(QA_PROMPT)
     formatted = prompt.format(context=context, question=question)
+    
     model = ChatGroq(model_name=model_name, temperature=temperature, api_key=groq_api_key or os.environ.get("GROQ_API_KEY"))
     try:
         res = model.invoke(formatted)
@@ -444,564 +511,247 @@ def ask_groq_with_docs(docs, question, model_name="llama-3.3-70b-versatile", tem
     except Exception as e:
         return f"LLM error: {e}"
 
-# ==============================================================================
-# UI: ROLE-BASED ACCESS CONTROL
-# ==============================================================================
-
-def show_user_panel():
-    """Display user info and role in sidebar."""
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("👤 User Role & Access")
-
-    # Let developer switch freely (for now)
-    role_options = ['viewer', 'editor', 'admin']
-    st.session_state.user_role = st.sidebar.selectbox(
-        "Select Role",
-        role_options,
-        index=role_options.index(st.session_state.user_role) if 'user_role' in st.session_state else 0,
-        help="Switch between roles (for testing). Viewer = read-only, Editor = can upload/edit, Admin = full control."
-    )
-
-    st.sidebar.markdown(f"**🧭 Current Role:** `{st.session_state.user_role.upper()}`")
-
-def check_permission(required_role: str) -> bool:
-    """Check if user has required permission."""
-    roles = {'viewer': 1, 'editor': 2, 'admin': 3}
-    return roles.get(st.session_state.user_role, 0) >= roles.get(required_role, 0)
-
-# ==============================================================================
-# PAGES: ENHANCED UI COMPONENTS
-# ==============================================================================
-
-def page_dashboard():
-    """Dashboard with analytics and metrics."""
-    st.markdown('<h2 class="section-title">📊 Dashboard</h2>', unsafe_allow_html=True)
-    
-    metadata = load_metadata()
-    metrics = load_metrics()
-    
-    # Key metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.markdown('<div class="metric">', unsafe_allow_html=True)
-        st.metric("Total Documents", len(metadata))
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown('<div class="metric">', unsafe_allow_html=True)
-        st.metric("Total Tables", metrics.get('total_tables', 0))
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown('<div class="metric">', unsafe_allow_html=True)
-        st.metric("Total Images", metrics.get('total_images', 0))
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col4:
-        st.markdown('<div class="metric">', unsafe_allow_html=True)
-        st.metric("Avg Extract Time", f"{metrics.get('avg_extraction_time', 0):.2f}s")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Recent uploads
-    st.markdown("### Recent Uploads")
-    if metadata:
-        recent = sorted(metadata.items(), key=lambda x: x[1].get('uploaded_at', 0), reverse=True)[:5]
-        for doc_id, info in recent:
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                st.write(f"📄 {info['file_name']}")
-            with col2:
-                st.caption(f"Pages: {info.get('pages', 'N/A')}")
-            with col3:
-                ts = datetime.fromtimestamp(info.get('uploaded_at', 0)).strftime('%m/%d')
-                st.caption(ts)
-    else:
-        st.info("No documents uploaded yet.")
+# ==== PAGE FUNCTIONS ====
 
 def page_upload():
-    """Upload and ingest PDFs."""
-    st.markdown('<h2 class="section-title">📤 Upload & Ingest PDFs</h2>', unsafe_allow_html=True)
-    
+    st.header("📤 Advanced PDF Upload & Ingest")
     if not check_permission('editor'):
-        st.error("❌ You need editor permissions to upload documents.")
-        return
+        st.error("Need editor permissions to upload."); return
     
     col1, col2 = st.columns([2, 1])
     with col1:
-        department = st.text_input("📁 Department / Tag (optional)", placeholder="e.g., Finance, HR, Engineering")
+        department = st.text_input("Department/Tag (optional)")
     with col2:
-        use_ocr = st.checkbox("Use OCR for scanned PDFs", value=True)
+        use_ocr = st.checkbox("Enable OCR", value=True)
     
-    uploaded_files = st.file_uploader("📎 Upload PDF files", type=["pdf"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    use_llm_labels = st.checkbox("Use LLM for intelligent image labels (requires API key)", value=False)
     
-    if st.button("🚀 Ingest Selected Files", type="primary"):
+    if st.button("🚀 Ingest Files", type="primary"):
         if not uploaded_files:
-            st.warning("Please select PDFs to upload.")
-        else:
-            metadata = load_metadata()
-            metrics = load_metrics()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            total = len(uploaded_files)
-            
-            for count, f in enumerate(uploaded_files):
-                start_time = time.time()
-                status_text.text(f"Processing {f.name}... ({count+1}/{total})")
+            st.warning("Select PDFs to upload."); return
+        
+        metadata = load_metadata()
+        progress = st.progress(0)
+        status_text = st.empty()
+        total = len(uploaded_files)
+        
+        for count, f in enumerate(uploaded_files):
+            status_text.text(f"Processing {f.name}... ({count+1}/{total})")
+            try:
+                raw = f.read()
+                doc_id = make_doc_id()
+                fname = f"{doc_id}_{f.name}"
+                (DOCS_DIR / fname).write_bytes(raw)
                 
+                # Advanced extraction
+                pages_data, toc = extract_text_pdf_advanced(raw, use_ocr_if_empty=use_ocr)
+                tables = extract_tables_pdf(raw)
+                
+                # Extract images with LLM labels
+                groq_key = os.environ.get("GROQ_API_KEY") if use_llm_labels else None
+                images = extract_images_pdf_with_context(raw, doc_id, groq_api_key=groq_key)
+                
+                doc_meta = {
+                    "doc_id": doc_id,
+                    "file_name": fname,
+                    "uploaded_at": time.time(),
+                    "toc": toc,
+                    "department": department,
+                    "is_scanned": is_scanned_pdf(raw),
+                    "pages_count": len(pages_data)
+                }
+                
+                chunks, ch_meta = chunk_document_pages_advanced(pages_data, doc_meta)
+                db = build_or_load_faiss(chunks, ch_meta)
+                
+                if tables:
+                    (TABLES_DIR / f"{doc_id}_tables.json").write_text(json.dumps(tables, indent=2), encoding="utf8")
+                
+                if images:
+                    img_meta = load_image_metadata()
+                    img_meta[doc_id] = images
+                    save_image_metadata(img_meta)
+                
+                metadata[doc_id] = {
+                    "doc_id": doc_id,
+                    "file_name": fname,
+                    "pages": len(pages_data),
+                    "toc": toc,
+                    "tables": len(tables),
+                    "images": len(images),
+                    "uploaded_at": time.time(),
+                    "is_scanned": is_scanned_pdf(raw)
+                }
+                save_metadata(metadata)
+                audit_log("UPLOAD", f"Uploaded {f.name} (ID: {doc_id})")
+                st.success(f"✅ Ingested {f.name}")
+            except Exception as e:
+                st.error(f"❌ Failed {f.name}: {e}")
+                st.exception(traceback.format_exc())
+            
+            progress.progress((count+1)/total)
+        
+        st.balloons()
+
+def page_images():
+    st.header("🖼️ Advanced Image Gallery")
+    img_meta = load_image_metadata()
+    
+    if not img_meta:
+        st.info("No images extracted yet."); return
+    
+    for doc_id, images in img_meta.items():
+        st.subheader(f"Images from Document: {doc_id}")
+        
+        cols = st.columns(3)
+        for i, img_info in enumerate(images):
+            with cols[i % 3]:
                 try:
-                    raw = f.read()
-                    doc_id = make_doc_id()
-                    fname = f"{doc_id}_{f.name}"
-                    (DOCS_DIR / fname).write_bytes(raw)
-                    
-                    pages, toc = extract_text_pdf(raw, use_ocr_if_empty=use_ocr)
-                    tables = extract_tables_pdf(raw)
-                    images = extract_images_pdf(raw, doc_id)
-                    
-                    extraction_time = time.time() - start_time
-                    
-                    doc_meta = {
-                        "doc_id": doc_id,
-                        "file_name": fname,
-                        "uploaded_at": time.time(),
-                        "toc": toc,
-                        "department": department,
-                        "pages_count": len(pages),
-                        "extraction_time": extraction_time
-                    }
-                    
-                    chunks, ch_meta = chunk_document_pages(pages, doc_meta)
-                    db = build_or_load_faiss(chunks, ch_meta)
-                    
-                    if tables:
-                        tbl_file = TABLES_DIR / f"{doc_id}_tables.json"
-                        tbl_file.write_text(json.dumps(tables, indent=2), encoding="utf8")
-                    
-                    metadata[doc_id] = {
-                        "doc_id": doc_id,
-                        "file_name": fname,
-                        "pages": len(pages),
-                        "toc": toc,
-                        "tables": len(tables),
-                        "images": len(images),
-                        "uploaded_at": time.time(),
-                        "extraction_time": extraction_time
-                    }
-                    save_metadata(metadata)
-                    
-                    # Update metrics
-                    metrics['total_docs'] = len(metadata)
-                    metrics['total_tables'] = metrics.get('total_tables', 0) + len(tables)
-                    metrics['total_images'] = metrics.get('total_images', 0) + len(images)
-                    times = [m.get('extraction_time', 0) for m in metadata.values()]
-                    metrics['avg_extraction_time'] = sum(times) / len(times) if times else 0
-                    save_metrics(metrics)
-                    
-                    audit_log("UPLOAD", f"Uploaded {f.name} (ID: {doc_id})")
-                    
-                    st.success(f"✅ Ingested {f.name}")
-                    
-                except pytesseract.pytesseract.TesseractNotFoundError:
-                    st.error(f"⚠️ Tesseract not installed for {f.name}")
+                    if Path(img_info["file"]).exists():
+                        img = Image.open(img_info["file"])
+                        st.image(img, use_column_width=True)
+                        
+                        with st.expander("📝 Details"):
+                            st.write(f"**Page:** {img_info['page']}")
+                            st.write(f"**OCR Text:** {img_info.get('ocr_caption', 'N/A')[:100]}")
+                            st.write(f"**LLM Label:** {img_info.get('llm_label', 'N/A')[:150]}")
+                            st.write(f"**Context:** {img_info.get('context', 'N/A')[:100]}")
+                        
+                        with open(img_info["file"], 'rb') as f:
+                            st.download_button("⬇️ Download", f.read(), file_name=Path(img_info["file"]).name)
                 except Exception as e:
-                    st.error(f"❌ Failed to process {f.name}: {str(e)}")
-                    audit_log("UPLOAD_ERROR", f"Failed to upload {f.name}: {str(e)}")
+                    st.error(f"Image error: {e}")
+
+def page_search():
+    st.header("🔍 Advanced Search & Q&A")
+    
+    metadata = load_metadata()
+    doc_options = ["All Documents"] + [info.get("file_name", doc_id) for doc_id, info in metadata.items()]
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        query = st.text_input("Search query")
+    with col2:
+        selected_doc = st.selectbox("Filter by document", doc_options)
+    with col3:
+        k = st.slider("Results", 1, 15, 5)
+    
+    tab1, tab2 = st.tabs(["Semantic Search", "Q&A (RAG)"])
+    
+    with tab1:
+        if st.button("Search"):
+            if not query.strip():
+                st.warning("Enter query."); return
+            try:
+                embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+                db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
+                docs = db.similarity_search(query, k=k)
                 
-                progress_bar.progress((count + 1) / total)
+                # Filter if needed
+                if selected_doc != "All Documents":
+                    docs = [d for d in docs if d.metadata.get("source", "") == selected_doc]
+                
+                st.success(f"Found {len(docs)} results")
+                for i, d in enumerate(docs):
+                    md = d.metadata
+                    snippet = d.page_content[:500]
+                    doc_type = "Scanned" if md.get("is_scanned") else "Digital"
+                    
+                    with st.expander(f"📄 Result {i+1}: {md.get('source')} | Page {md.get('page')} ({doc_type})"):
+                        st.write(snippet)
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+    
+    with tab2:
+        if st.button("Get Answer (RAG)"):
+            if not query.strip():
+                st.warning("Enter question."); return
+            if not os.environ.get("GROQ_API_KEY"):
+                st.error("Set Groq API key."); return
             
-            status_text.empty()
-            progress_bar.empty()
-            st.balloons()
+            try:
+                embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+                db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
+                docs = db.similarity_search(query, k=k)
+                
+                with st.spinner("🤔 Thinking..."):
+                    ans = ask_groq_with_docs(docs, query, doc_filter=selected_doc, groq_api_key=os.environ.get("GROQ_API_KEY"))
+                
+                st.markdown("### 📝 Answer")
+                st.markdown(ans)
+                
+                with st.expander("📚 Source Documents"):
+                    for d in docs:
+                        md = d.metadata
+                        doc_type = "Scanned" if md.get("is_scanned") else "Digital"
+                        st.write(f"**{md.get('source')}** - Page {md.get('page')}, Type: {doc_type}")
+            except Exception as e:
+                st.error(f"Q&A failed: {e}")
 
 def page_documents():
-    """Browse and manage documents."""
-    st.markdown('<h2 class="section-title">📚 Documents</h2>', unsafe_allow_html=True)
-    
+    st.header("📚 Documents")
     metadata = load_metadata()
     
     if not metadata:
-        st.info("No documents ingested yet.")
-        return
+        st.info("No documents yet."); return
     
-    # Filter by department
-    departments = set()
-    for info in metadata.values():
-        if info.get('department'):
-            departments.add(info['department'])
-    
-    if departments:
-        selected_dept = st.selectbox("Filter by department", ["All"] + sorted(list(departments)))
-    else:
-        selected_dept = "All"
-    
-    # Display documents
     for doc_id, info in sorted(metadata.items(), key=lambda x: x[1].get('uploaded_at', 0), reverse=True):
-        if selected_dept != "All" and info.get('department') != selected_dept:
-            continue
-        
-        with st.expander(f"📄 {info['file_name']} ({doc_id})", expanded=False):
+        doc_type = "🔍 Scanned" if info.get("is_scanned") else "📄 Digital"
+        with st.expander(f"{doc_type} {info.get('file_name')} ({doc_id})"):
             col1, col2, col3 = st.columns(3)
-            
             with col1:
-                st.metric("📄 Pages", info.get('pages', 'N/A'))
+                st.metric("Pages", info.get("pages", "N/A"))
             with col2:
-                st.metric("📊 Tables", info.get('tables', 0))
+                st.metric("Tables", info.get("tables", 0))
             with col3:
-                st.metric("🖼️ Images", info.get('images', 0))
+                st.metric("Images", info.get("images", 0))
             
-            st.caption(f"⏰ Uploaded: {datetime.fromtimestamp(info.get('uploaded_at', 0)).strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if st.button(f"👁️ View", key=f"view_{doc_id}"):
-                    st.session_state.selected_doc = doc_id
-            
-            with col2:
-                if st.button(f"🗑️ Delete", key=f"delete_{doc_id}") and check_permission('admin'):
-                    fpath = DOCS_DIR / info["file_name"]
-                    if fpath.exists():
-                        fpath.unlink()
-                    del metadata[doc_id]
-                    save_metadata(metadata)
-                    audit_log("DELETE", f"Deleted document {doc_id}")
-                    st.success("Document deleted")
-            
-            with col3:
-                if st.button(f"⬇️ Export", key=f"export_{doc_id}"):
-                    fpath = DOCS_DIR / info["file_name"]
-                    if fpath.exists():
-                        with open(fpath, 'rb') as f:
-                            st.download_button(
-                                "📥 Download PDF",
-                                f.read(),
-                                file_name=info['file_name'],
-                                key=f"dl_{doc_id}"
-                            )
-
-def page_tables():
-    """View and edit extracted tables."""
-    st.markdown('<h2 class="section-title">📊 Tables</h2>', unsafe_allow_html=True)
-    
-    metadata = load_metadata()
-    tables_files = list(TABLES_DIR.glob("*.json"))
-    
-    if not tables_files:
-        st.info("No tables extracted yet.")
-        return
-    
-    # Select document
-    doc_choices = {info['file_name']: doc_id for doc_id, info in metadata.items()}
-    selected_doc_name = st.selectbox("Select Document", ["All"] + list(doc_choices.keys()))
-    
-    for tbl_file in tables_files:
-        doc_id = tbl_file.name.split('_')[0]
-        if selected_doc_name != "All" and doc_choices.get(selected_doc_name) != doc_id:
-            continue
-        
-        try:
-            tlist = json.loads(tbl_file.read_text(encoding="utf8"))
-            for i, t in enumerate(tlist):
-                with st.expander(f"📊 Table {i+1} (Page {t['page']})", expanded=False):
-                    df = pd.DataFrame(t["rows"])
-                    
-                    # Editable table
-                    if check_permission('editor'):
-                        edited_df = st.data_editor(df, key=f"table_{doc_id}_{i}", use_container_width=True)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("💾 Save Changes", key=f"save_{doc_id}_{i}"):
-                                t["rows"] = edited_df.to_dict(orient='records')
-                                tbl_file.write_text(json.dumps(tlist, indent=2), encoding="utf8")
-                                audit_log("TABLE_EDIT", f"Edited table {i} in {doc_id}")
-                                st.success("✅ Table updated")
-                        
-                        with col2:
-                            csv = edited_df.to_csv(index=False)
-                            st.download_button(
-                                "📥 Download CSV",
-                                csv,
-                                file_name=f"table_{i}.csv",
-                                key=f"csv_{doc_id}_{i}"
-                            )
-                    else:
-                        st.dataframe(df, use_container_width=True)
-                        csv = df.to_csv(index=False)
-                        st.download_button(
-                            "📥 Download CSV",
-                            csv,
-                            file_name=f"table_{i}.csv",
-                            key=f"csv_view_{doc_id}_{i}"
-                        )
-        except Exception as e:
-            st.error(f"Failed to load table: {e}")
-
-def page_images():
-    """View and annotate extracted images."""
-    st.markdown('<h2 class="section-title">🖼️ Images Gallery</h2>', unsafe_allow_html=True)
-    
-    image_files = list(IMAGES_DIR.glob("*"))
-    
-    if not image_files:
-        st.info("No images extracted yet.")
-        return
-    
-    # Create image gallery
-    cols = st.columns(3)
-    
-    for i, img_file in enumerate(sorted(image_files)):
-        with cols[i % 3]:
-            try:
-                img = Image.open(img_file)
-                st.image(img, use_column_width=True)
-                
-                # Editable caption
-                caption_key = f"caption_{img_file.name}"
-                if caption_key not in st.session_state:
-                    st.session_state[caption_key] = img_file.stem
-                
-                caption = st.text_input(
-                    "Caption",
-                    value=st.session_state.get(caption_key, img_file.stem),
-                    key=f"cap_{img_file.name}",
-                    label_visibility="collapsed"
-                )
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.caption(f"📄 {img_file.name}")
-                with col2:
-                    with open(img_file, 'rb') as f:
-                        st.download_button(
-                            "⬇️",
-                            f.read(),
-                            file_name=img_file.name,
-                            key=f"dl_img_{img_file.name}"
-                        )
-            except Exception as e:
-                st.error(f"Failed to load image: {e}")
-
-def page_search():
-    """Semantic search and Q&A interface."""
-    st.markdown('<h2 class="section-title">🔍 Search & Q&A</h2>', unsafe_allow_html=True)
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        query = st.text_input("🔎 Enter your search query", placeholder="Ask anything about your documents...")
-    with col2:
-        k = st.slider("Results", 1, 15, 5)
-    
-    tab1, tab2 = st.tabs(["🔍 Semantic Search", "🤖 Q&A with RAG"])
-    
-    with tab1:
-        if st.button("Search", type="primary"):
-            if not query.strip():
-                st.warning("Enter a search query.")
-            else:
-                try:
-                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                    db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                    docs = db.similarity_search(query, k=k)
-                    
-                    audit_log("SEARCH", f"Query: {query}")
-                    
-                    st.success(f"Found {len(docs)} results")
-                    
-                    for i, d in enumerate(docs):
-                        md = d.metadata
-                        snippet = postprocess_extracted_text(d.page_content)[:500]
-                        
-                        with st.expander(f"📄 Result {i+1}: {md.get('source')} (Page {md.get('page')})"):
-                            st.write(snippet)
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.caption(f"Doc ID: {md.get('doc_id')}")
-                            with col2:
-                                st.caption(f"Paragraph: {md.get('paragraph')}")
-                except Exception as e:
-                    st.error(f"Search failed: {e}")
-    
-    with tab2:
-        if st.button("Get Answer (RAG)", type="primary"):
-            if not query.strip():
-                st.warning("Enter a question.")
-            elif not os.environ.get("GROQ_API_KEY"):
-                st.error("❌ Set Groq API key in sidebar first.")
-            else:
-                try:
-                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                    db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                    docs = db.similarity_search(query, k=k)
-                    
-                    with st.spinner("🤔 Thinking..."):
-                        ans = ask_groq_with_docs(docs, query, groq_api_key=os.environ.get("GROQ_API_KEY"))
-                    
-                    audit_log("QA", f"Query: {query}")
-                    
-                    st.markdown("### 📝 Answer")
-                    st.markdown(ans)
-                    
-                    with st.expander("📚 Source Documents"):
-                        for d in docs:
-                            md = d.metadata
-                            st.write(f"**{md.get('source')}** - Page {md.get('page')}, Paragraph {md.get('paragraph')}")
-                except Exception as e:
-                    st.error(f"QA failed: {e}")
+            st.caption(f"⏰ {datetime.fromtimestamp(info.get('uploaded_at', 0)).strftime('%Y-%m-%d %H:%M')}")
 
 def page_admin():
-    """Admin panel for system management."""
-    st.markdown('<h2 class="section-title">⚙️ Admin Panel</h2>', unsafe_allow_html=True)
-    
+    st.header("⚙️ Admin Panel")
     if not check_permission('admin'):
-        st.error("❌ You need admin permissions to access this page.")
-        return
+        st.error("Need admin permissions."); return
     
-    tab1, tab2, tab3, tab4 = st.tabs(["🔧 Management", "📈 Statistics", "🔐 Audit Log", "📥 Export"])
-    
-    with tab1:
-        st.subheader("System Management")
-        
-        if st.button("🔄 Rebuild FAISS Index"):
-            try:
-                metadata = load_metadata()
-                all_chunks, all_meta = [], []
-                
-                with st.spinner("Rebuilding..."):
-                    for doc_id, info in metadata.items():
-                        fpath = DOCS_DIR / info["file_name"]
-                        if not fpath.exists():
-                            continue
-                        raw = fpath.read_bytes()
-                        pages, _ = extract_text_pdf(raw, use_ocr_if_empty=True)
-                        chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": info["file_name"]})
-                        all_chunks += chunks
-                        all_meta += ch_meta
-                
-                build_or_load_faiss(all_chunks, all_meta)
-                st.success("✅ FAISS index rebuilt successfully")
-            except Exception as e:
-                st.error(f"Rebuild failed: {e}")
-        
-        st.write("---")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Docs Storage", len(list(DOCS_DIR.glob("*"))))
-        with col2:
-            st.metric("Tables Files", len(list(TABLES_DIR.glob("*.json"))))
-        with col3:
-            st.metric("Images", len(list(IMAGES_DIR.glob("*"))))
-    
-    with tab2:
-        st.subheader("Document Statistics")
-        metadata = load_metadata()
-        metrics = load_metrics()
-        
-        if metadata:
-            pages = [info.get('pages', 0) for info in metadata.values()]
-            times = [info.get('extraction_time', 0) for info in metadata.values()]
+    if st.button("🔄 Rebuild FAISS"):
+        try:
+            metadata = load_metadata()
+            all_chunks, all_meta = [], []
+            for doc_id, info in metadata.items():
+                fpath = DOCS_DIR / info["file_name"]
+                if not fpath.exists():
+                    continue
+                raw = fpath.read_bytes()
+                pages_data, _ = extract_text_pdf_advanced(raw)
+                chunks, ch_meta = chunk_document_pages_advanced(pages_data, {"doc_id": doc_id, "file_name": info["file_name"]})
+                all_chunks += chunks
+                all_meta += ch_meta
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Pages", sum(pages))
-            with col2:
-                st.metric("Avg Pages/Doc", round(sum(pages) / len(pages), 1) if pages else 0)
-            with col3:
-                st.metric("Total Images", metrics.get('total_images', 0))
-    
-    with tab3:
-        st.subheader("Audit Log")
-        if AUDIT_LOG.exists():
-            log_content = AUDIT_LOG.read_text()
-            st.text_area("Recent Activity", log_content[-2000:], height=300, disabled=True)
-        else:
-            st.info("No audit log yet.")
-    
-    with tab4:
-        st.subheader("Export & Backup")
-        
-        metadata = load_metadata()
-        
-        if st.button("📦 Create Backup (ZIP)"):
-            import zipfile
-            zip_path = DATA_DIR / "backup.zip"
-            
-            with zipfile.ZipFile(zip_path, "w") as z:
-                for f in DOCS_DIR.glob("*"):
-                    z.write(f, arcname=f"docs/{f.name}")
-                for f in TABLES_DIR.glob("*"):
-                    z.write(f, arcname=f"tables/{f.name}")
-                for f in IMAGES_DIR.glob("*"):
-                    z.write(f, arcname=f"images/{f.name}")
-                z.write(METADATA_FILE, arcname="metadata.json")
-            
-            with open(zip_path, "rb") as f:
-                st.download_button(
-                    "📥 Download Backup",
-                    f.read(),
-                    file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                )
+            build_or_load_faiss(all_chunks, all_meta)
+            st.success("✅ FAISS rebuilt")
+        except Exception as e:
+            st.error(f"Failed: {e}")
 
-# ==============================================================================
-# MAIN APP
-# ==============================================================================
+# ==== MAIN ====
+st.sidebar.title("📚 PDF Knowledge Pro")
 
-def main():
-    """Main application entry point."""
-    
-    # Sidebar header
-    st.sidebar.title("📚 Enterprise PDF → Knowledge")
-    st.sidebar.markdown("Transform PDFs into searchable, structured knowledge")
-    
-    # Navigation
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧭 Navigation")
-    page = st.sidebar.radio(
-        "Select Page",
-        ["Dashboard", "Upload & Ingest", "Documents", "Tables", "Images", "Search & Q&A", "Admin"]
-    )
-    
-    # LLM Configuration
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⚙️ Configuration")
-    groq_key = st.sidebar.text_input("Groq API Key", type="password", placeholder="sk-...")
-    if groq_key:
-        os.environ["GROQ_API_KEY"] = groq_key
-        st.sidebar.caption("✅ API Key set")
-    else:
-        st.sidebar.caption("⚠️ No API key provided")
-    
-    # User panel
-    show_user_panel()
-    
-    # Main content
-    st.markdown('<h1 class="main-header">📚 Enterprise PDF → Knowledge Hub</h1>', unsafe_allow_html=True)
-    
-    if page == "Dashboard":
-        page_dashboard()
-    elif page == "Upload & Ingest":
-        page_upload()
-    elif page == "Documents":
-        page_documents()
-    elif page == "Tables":
-        page_tables()
-    elif page == "Images":
-        page_images()
-    elif page == "Search & Q&A":
-        page_search()
-    elif page == "Admin":
-        page_admin()
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; color: #888;">
-    Built with ❤️ | OCR + Table Extraction + Vector Search + RAG Q&A
-    </div>
-    """, unsafe_allow_html=True)
+groq_key = st.sidebar.text_input("Groq API Key", type="password")
+if groq_key:
+    os.environ["GROQ_API_KEY"] = groq_key
 
-if __name__ == "__main__":
-    main()
+page = st.sidebar.radio("Page", ["Upload", "Documents", "Images", "Search", "Admin"])
 
+if page == "Upload":
+    page_upload()
+elif page == "Documents":
+    page_documents()
+elif page == "Images":
+    page_images()
+elif page == "Search":
+    page_search()
+elif page == "Admin":
+    page_admin()
+
+st.markdown("---")
+st.markdown("Built with ❤️ | Advanced OCR + Deep Extraction + LLM Image Labeling + Filtered RAG")
