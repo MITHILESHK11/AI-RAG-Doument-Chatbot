@@ -3,17 +3,18 @@ import os
 import re
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
+from PyPDF2 import PdfReader
+import pytesseract
+import pandas as pd
+import uuid
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from PyPDF2 import PdfReader
-import pytesseract
-from PIL import Image
-import pandas as pd
-import uuid
+from langchain_community.chains.question_answering import load_qa_chain
+from langchain_core.prompts import PromptTemplate
+
 
 # Set Streamlit page config
 st.set_page_config(page_title="AI Document Chatbot", page_icon="📚", layout="wide")
@@ -394,5 +395,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
