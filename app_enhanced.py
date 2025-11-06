@@ -464,7 +464,6 @@ def show_user_panel():
 
     st.sidebar.markdown(f"**🧭 Current Role:** `{st.session_state.user_role.upper()}`")
 
-
 def check_permission(required_role: str) -> bool:
     """Check if user has required permission."""
     roles = {'viewer': 1, 'editor': 2, 'admin': 3}
