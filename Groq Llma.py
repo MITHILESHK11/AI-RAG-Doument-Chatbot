@@ -8,16 +8,14 @@ from PyPDF2 import PdfReader
 import pytesseract
 import pandas as pd
 import uuid
-import traceback
 
-# ---- Modern LangChain Imports ----
+# ✅ Modern LangChain 2025+ imports
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
-from langchain_community.chains.question_answering import load_qa_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain  # ✅ replacement for old QA chain
 from langchain_groq import ChatGroq
-
 
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="AI Document Chatbot", page_icon="📚", layout="wide")
@@ -231,3 +229,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
