@@ -208,7 +208,7 @@ def build_context_from_docs(docs):
     # join with separator, keep size reasonable
     return "\n\n---\n\n".join(parts)
 
-def generate_answer_from_docs(docs, question, model_name="gemini-1.5-pro", temperature=0.2):
+def generate_answer_from_docs(docs, question, model_name="gemini-2.5-pro", temperature=0.2):
     if not docs:
         return "Answer is not available in the context."
     context = build_context_from_docs(docs)
@@ -221,7 +221,7 @@ def generate_answer_from_docs(docs, question, model_name="gemini-1.5-pro", tempe
         answer = f"LLM error: {e}\n\nTrace:\n{traceback.format_exc()}"
     return answer
 
-def generate_theme_summary(docs, question, model_name="gemini-1.5-pro", temperature=0.5):
+def generate_theme_summary(docs, question, model_name="gemini-2.5-pro", temperature=0.5):
     if not docs:
         return "No themes available."
     context = build_context_from_docs(docs)
@@ -324,4 +324,5 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
