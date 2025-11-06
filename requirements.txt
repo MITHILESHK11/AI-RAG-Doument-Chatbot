@@ -20,3 +20,4 @@ pandas
 requests
 opencv-python-headless
 python-dotenv
+pymongo
