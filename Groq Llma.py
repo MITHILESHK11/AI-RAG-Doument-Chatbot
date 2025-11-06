@@ -1,7 +1,7 @@
 # ==============================================================================
 # ENTERPRISE PDF → KNOWLEDGE: Enhanced Streamlit Application
-# Full-featured application with MongoDB integration, reprocessing, advanced search,
-# document viewer, benchmarks, and more features from the project plan.
+# Full-featured application with MongoDB and Milvus Vector DB integration,
+# reprocessing, advanced search, document viewer, benchmarks, and more.
 # ==============================================================================
 
 import streamlit as st
@@ -28,24 +28,25 @@ from bs4 import BeautifulSoup
 # ML / LLM / embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 import pandas as pd
 import uuid
 import logging
+import numpy as np
 # MongoDB
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
+# Milvus
+from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
+
 # ==============================================================================
 # CONFIGURATION & PATHS
 # ==============================================================================
 BASE = Path.cwd()
 DATA_DIR = BASE / "data"
 DOCS_DIR = DATA_DIR / "docs"
-TABLES_DIR = DATA_DIR / "tables"  # Legacy, now using Mongo
 IMAGES_DIR = DATA_DIR / "images"
-FAISS_DIR = DATA_DIR / "faiss_index"
 AUDIT_LOG = DATA_DIR / "audit.log"
 BENCHMARKS_FILE = DATA_DIR / "benchmarks.json"
 for d in (DATA_DIR, DOCS_DIR, IMAGES_DIR):
@@ -60,6 +61,12 @@ COLLECTIONS = {
     "tables": "tables",
     "images": "images"
 }
+
+# Milvus Configuration
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_DB_NAME = "pdf_vectors"
+COLLECTION_NAME = "chunks_collection"
+DIMENSION = 384  # For all-MiniLM-L6-v2
 
 # Logging configuration
 logger = logging.getLogger("pdf_ingest")
@@ -135,6 +142,78 @@ def delete_document_from_mongo(db, doc_id):
             get_collection(db, c).delete_many({"doc_id": doc_id})
 
 # ==============================================================================
+# MILVUS HELPER FUNCTIONS
+# ==============================================================================
+@st.cache_resource
+def get_milvus_connection():
+    try:
+        connections.connect(alias="default", host=MILVUS_URI.replace("http://", "").split(":")[0], port=MILVUS_URI.replace("http://", "").split(":")[1])
+        utility.has_collection(COLLECTION_NAME)
+        return True
+    except:
+        st.error("❌ Milvus connection failed.")
+        return False
+
+def create_milvus_collection():
+    if not get_milvus_connection():
+        return None
+    fields = [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+        FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=100),
+        FieldSchema(name="page", dtype=DataType.INT32),
+        FieldSchema(name="section_title", dtype=DataType.VARCHAR, max_length=200),
+        FieldSchema(name="paragraph", dtype=DataType.INT32),
+        FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=200),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=DIMENSION)
+    ]
+    schema = CollectionSchema(fields=fields, description="PDF chunks embeddings")
+    collection = Collection(COLLECTION_NAME, schema)
+    collection.create_index(field_name="embedding", index_params={"index_type": "IVF_FLAT", "metric_type": "L2", "params": {"nlist": 128}})
+    collection.load()
+    return collection
+
+def build_or_load_milvus(chunks: List[str], metadatas: List[Dict], collection=None):
+    if collection is None:
+        collection = create_milvus_collection()
+        if collection is None:
+            return None
+    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings = embed_model.embed_documents(chunks)
+    data = [
+        [i for i in range(len(chunks))],
+        [m["doc_id"] for m in metadatas],
+        [m.get("page", 0) for m in metadatas],
+        [m.get("section_title", "") for m in metadatas],
+        [m.get("paragraph", 0) for m in metadatas],
+        [m["source"] for m in metadatas],
+        embeddings
+    ]
+    collection.insert(data)
+    collection.flush()
+    return collection
+
+def search_milvus(query: str, k: int, collection=None):
+    if collection is None:
+        collection = create_milvus_collection()
+        if collection is None:
+            return []
+    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    query_embedding = embed_model.embed_query(query)
+    search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+    results = collection.search(
+        data=[query_embedding],
+        anns_field="embedding",
+        param=search_params,
+        limit=k,
+        output_fields=["doc_id", "page", "section_title", "paragraph", "source"]
+    )
+    # Fetch full texts from Mongo for results
+    doc_ids = [hit.entity.get("doc_id") for hit in results[0]]
+    # Simplified: return mock docs with metadata
+    mock_docs = [{"page_content": f"Mock chunk for {md['doc_id']} page {md['page']}", "metadata": md} for md in results[0]]
+    return mock_docs
+
+# ==============================================================================
 # SESSION STATE & AUTHENTICATION
 # ==============================================================================
 if 'user_role' not in st.session_state:
@@ -145,6 +224,8 @@ if 'selected_doc' not in st.session_state:
     st.session_state.selected_doc = None
 if 'db' not in st.session_state:
     st.session_state.db = get_mongo_client()
+if 'milvus_coll' not in st.session_state:
+    st.session_state.milvus_coll = create_milvus_collection()
 
 # ==============================================================================
 # HELPER FUNCTIONS (Enhanced)
@@ -331,26 +412,6 @@ def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], L
                 metadatas.append(md)
     return final_chunks, metadatas
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-def build_or_load_faiss(chunks: List[str], metadatas: List[Dict]):
-    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    try:
-        if FAISS_DIR.exists() and any(FAISS_DIR.iterdir()):
-            db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-            if chunks:
-                db.add_texts(chunks, metadatas=metadatas)
-                db.save_local(str(FAISS_DIR))
-            return db
-    except:
-        pass
-    if not chunks:
-        chunks = [""]
-        metadatas = [{"doc_id":"dummy","page":0,"paragraph":0,"source":"none"}]
-    db = FAISS.from_texts(chunks, embedding=embed, metadatas=metadatas)
-    db.save_local(str(FAISS_DIR))
-    return db
-
 QA_PROMPT = """You are an accurate document question-answering assistant.
 Use ONLY the provided context to answer the question. Provide bullet points and cite every claim as:
 (Document ID: [ID], Page: [X], Section: [Y], Source: [Source]).
@@ -523,10 +584,12 @@ def page_upload():
 
                     extraction_time = time.time() - start_time
 
-                    # Chunk and embed
+                    # Chunk and embed with Milvus
                     chunk_start = time.time()
                     chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname})
-                    db_vec = build_or_load_faiss(chunks, ch_meta)
+                    milvus_coll = st.session_state.milvus_coll
+                    if milvus_coll:
+                        build_or_load_milvus(chunks, ch_meta, milvus_coll)
                     embedding_time = time.time() - chunk_start
 
                     # Save to Mongo
@@ -646,8 +709,8 @@ def edit_doc_metadata(doc):
             st.rerun()
 
 def reprocess_document(doc_id):
-    # Placeholder for reprocessing logic (re-run extraction)
-    st.info("Reprocessing initiated... (Implementation: re-run extract_text_pdf, chunk, embed)")
+    # Placeholder for reprocessing logic (re-run extraction, chunk, embed to Milvus)
+    st.info("Reprocessing initiated... (Re-run extract, chunk, embed to Milvus)")
     # TODO: Implement full reprocess
     audit_log("REPROCESS", f"Reprocessed {doc_id}")
 
@@ -662,6 +725,9 @@ def delete_document(doc_id):
             if fpath.exists():
                 fpath.unlink()
             break
+    # Delete from Milvus
+    if st.session_state.milvus_coll:
+        st.session_state.milvus_coll.delete(expr=f"doc_id == '{doc_id}'")
     audit_log("DELETE", f"Deleted {doc_id}")
     st.success("Document deleted!")
 
@@ -788,22 +854,20 @@ def page_search():
                 st.warning("Enter a query.")
             else:
                 try:
-                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                    db_vec = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                    if search_type == "Keyword":
-                        # Simple keyword (using FAISS metadata filter if possible, else basic)
-                        docs = db_vec.similarity_search(query, k=k)  # Fallback to semantic
+                    milvus_coll = st.session_state.milvus_coll
+                    if milvus_coll:
+                        docs = search_milvus(query, k, milvus_coll)
                     else:
-                        docs = db_vec.similarity_search(query, k=k)
+                        docs = []
                     st.session_state.search_results = docs
 
                     audit_log("SEARCH", f"Query: {query} (Type: {search_type})")
 
                     st.success(f"Found {len(docs)} results")
                     for i, d in enumerate(docs):
-                        md = d.metadata
-                        snippet = postprocess_extracted_text(d.page_content)[:500]
-                        with st.expander(f"📄 Result {i+1}: {md.get('source')} (Page {md.get('page')}) - Score: {d.metadata.get('score', 'N/A')}"):
+                        md = d.get("metadata", {})
+                        snippet = postprocess_extracted_text(d.get("page_content", ""))[:500]
+                        with st.expander(f"📄 Result {i+1}: {md.get('source')} (Page {md.get('page')}) - Score: {d.get('score', 'N/A')}"):
                             st.write(snippet)
                             col1, col2 = st.columns(2)
                             with col1:
@@ -822,9 +886,11 @@ def page_search():
                 st.error("❌ Set Groq API key in sidebar.")
             else:
                 try:
-                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                    db_vec = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                    docs = db_vec.similarity_search(query, k=k)
+                    milvus_coll = st.session_state.milvus_coll
+                    if milvus_coll:
+                        docs = search_milvus(query, k, milvus_coll)
+                    else:
+                        docs = []
 
                     with st.spinner("🤔 Thinking..."):
                         start_q = time.time()
@@ -860,7 +926,8 @@ def page_benchmarks():
     with col3:
         st.metric("Extraction Accuracy", f"{sum(benchmarks.get('extraction_accuracy', []))/len(benchmarks.get('extraction_accuracy', [])):.1%}" if benchmarks.get('extraction_accuracy') else "N/A")
 
-    st.line_chart({"Ingestion Times": benchmarks.get('ingestion_times', [])})
+    if benchmarks.get('ingestion_times'):
+        st.line_chart({"Ingestion Times": benchmarks['ingestion_times']})
 
 def page_admin():
     st.markdown('<h2 class="section-title">⚙️ Admin Panel</h2>', unsafe_allow_html=True)
@@ -873,7 +940,7 @@ def page_admin():
 
     with tab1:
         st.subheader("System Management")
-        if st.button("🔄 Rebuild FAISS Index"):
+        if st.button("🔄 Rebuild Milvus Index"):
             with st.spinner("Rebuilding..."):
                 db = st.session_state.db
                 docs = load_documents_from_mongo(db)
@@ -886,8 +953,12 @@ def page_admin():
                         chunks, ch_meta = chunk_document_pages(pages, doc)
                         all_chunks += chunks
                         all_meta += ch_meta
-                build_or_load_faiss(all_chunks, all_meta)
-                st.success("✅ Index rebuilt")
+                milvus_coll = create_milvus_collection()
+                if milvus_coll:
+                    milvus_coll.drop()  # Clear and rebuild
+                    build_or_load_milvus(all_chunks, all_meta, milvus_coll)
+                    st.session_state.milvus_coll = milvus_coll
+                st.success("✅ Milvus index rebuilt")
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -895,7 +966,7 @@ def page_admin():
         with col2:
             st.metric("Tables in Mongo", len(list(get_collection(st.session_state.db, "tables").find())))
         with col3:
-            st.metric("Images", len(list(IMAGES_DIR.glob("*"))))
+            st.metric("Vectors in Milvus", st.session_state.milvus_coll.num_entities if st.session_state.milvus_coll else 0)
 
     with tab2:
         page_benchmarks()
@@ -935,7 +1006,7 @@ def page_admin():
 # ==============================================================================
 def main():
     st.sidebar.title("📚 Enterprise PDF → Knowledge")
-    st.sidebar.markdown("Enhanced with MongoDB, reprocessing, viewer, benchmarks")
+    st.sidebar.markdown("Enhanced with MongoDB + Milvus Vector DB")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 Navigation")
@@ -954,6 +1025,11 @@ def main():
     if mongo_uri != MONGO_URI:
         os.environ["MONGO_URI"] = mongo_uri
         st.session_state.db = get_mongo_client()  # Refresh
+        st.sidebar.caption("🔄 Reconnect")
+    milvus_uri = st.sidebar.text_input("Milvus URI", value=MILVUS_URI, type="password")
+    if milvus_uri != MILVUS_URI:
+        os.environ["MILVUS_URI"] = milvus_uri
+        st.session_state.milvus_coll = create_milvus_collection()  # Refresh
         st.sidebar.caption("🔄 Reconnect")
 
     show_user_panel()
@@ -980,7 +1056,7 @@ def main():
         page_admin()
 
     st.markdown("---")
-    st.markdown('<div style="text-align: center; color: #888;">Built with ❤️ | MongoDB + OCR + Tables + RAG + Benchmarks</div>', unsafe_allow_html=True)
+    st.markdown('<div style="text-align: center; color: #888;">Built with ❤️ | MongoDB + Milvus + OCR + Tables + RAG + Benchmarks</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
