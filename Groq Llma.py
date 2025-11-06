@@ -57,40 +57,39 @@ def safe_text(s):
 
 # -------------------- PDF processing helpers --------------------
 def extract_text_pdf(file_bytes: bytes):
-    """
-    Extract text page-by-page using PyPDF2 + fallback to pdfplumber for tables + OCR
-    Returns: pages: list[str], toc (best-effort)
-    """
     pages = []
     toc = []
-    # PyPDF2 extraction
     try:
         reader = PdfReader(BytesIO(file_bytes))
         for i, page in enumerate(reader.pages, start=1):
             text = page.extract_text() or ""
             text = safe_text(text)
             pages.append(text)
-        # try to get outline/toc
         try:
             outline = reader.outline
-            # outline is complex; we produce a simple list
             toc = [str(x.title) for x in outline] if hasattr(reader, "outline") else []
         except Exception:
             toc = []
     except Exception:
         pages = []
 
-    # if pages appear empty, fall back to pdfplumber + OCR
+    # If no text, try OCR fallback if available
     if not any(pages):
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            pages = []
-            for p in pdf.pages:
-                txt = p.extract_text() or ""
-                if not txt.strip():
-                    # use OCR on rasterized image of page
-                    im = p.to_image(resolution=200).original
-                    txt = pytesseract.image_to_string(im)
-                pages.append(safe_text(txt))
+        try:
+            import pdfplumber
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                for p in pdf.pages:
+                    txt = p.extract_text() or ""
+                    if not txt.strip():
+                        try:
+                            im = p.to_image(resolution=200).original
+                            txt = pytesseract.image_to_string(im)
+                        except pytesseract.TesseractNotFoundError:
+                            st.warning("⚠️ Tesseract not found — skipping OCR for scanned pages.")
+                            txt = ""
+                    pages.append(safe_text(txt))
+        except Exception as e:
+            st.error(f"OCR extraction failed: {e}")
     return pages, toc
 
 def extract_tables_pdf(file_bytes: bytes):
@@ -442,3 +441,4 @@ elif page == "Admin & Export":
 # Footer
 st.markdown("---")
 st.markdown("Built for converting enterprise PDFs into searchable knowledge — OCR, table extraction, chunking & semantic search.")
+
