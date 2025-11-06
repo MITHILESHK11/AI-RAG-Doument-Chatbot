@@ -11,6 +11,7 @@ import pandas as pd
 import uuid
 
 # ✅ Modern LangChain 2025+ Imports (no deprecated paths)
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -229,6 +230,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
