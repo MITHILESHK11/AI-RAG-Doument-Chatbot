@@ -451,18 +451,18 @@ def ask_groq_with_docs(docs, question, model_name="llama-3.3-70b-versatile", tem
 def show_user_panel():
     """Display user info and role in sidebar."""
     st.sidebar.markdown("---")
-    col1, col2 = st.sidebar.columns([1, 1])
-    with col1:
-        st.write("👤 Role:")
-    with col2:
-        role_options = ['viewer', 'editor', 'admin'] if st.session_state.user_role == 'admin' else ['viewer']
-        st.session_state.user_role = st.selectbox(
-            "User Role",
-            role_options,
-            index=0,
-            label_visibility="collapsed"
-        )
-    st.sidebar.markdown(f"**Status:** {st.session_state.user_role.upper()}")
+    st.sidebar.subheader("👤 User Role & Access")
+
+    # Let developer switch freely (for now)
+    role_options = ['viewer', 'editor', 'admin']
+    st.session_state.user_role = st.sidebar.selectbox(
+        "Select Role",
+        role_options,
+        index=role_options.index(st.session_state.user_role) if 'user_role' in st.session_state else 0,
+        help="Switch between roles (for testing). Viewer = read-only, Editor = can upload/edit, Admin = full control."
+    )
+
+    st.sidebar.markdown(f"**🧭 Current Role:** `{st.session_state.user_role.upper()}`")
 
 def check_permission(required_role: str) -> bool:
     """Check if user has required permission."""
@@ -1004,3 +1004,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
