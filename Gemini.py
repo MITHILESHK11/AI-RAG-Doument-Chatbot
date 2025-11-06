@@ -9,13 +9,12 @@ import pytesseract
 import pandas as pd
 import uuid
 
+# LangChain ecosystem imports (2025+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain_community.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
-
-
+from langchain.chains.combine_documents.base import create_stuff_documents_chain
 
 # Set Streamlit page config
 st.set_page_config(page_title="AI Document Chatbot", page_icon="📚", layout="wide")
@@ -396,6 +395,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
