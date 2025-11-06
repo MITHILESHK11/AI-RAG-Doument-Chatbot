@@ -9,12 +9,11 @@ import pytesseract
 import pandas as pd
 import uuid
 
-# ✅ Modern LangChain 2025+ Imports
+# ✅ Modern LangChain 2025+ Imports (no deprecated paths)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_groq import ChatGroq
 
 # -------------------- Streamlit UI --------------------
@@ -229,6 +228,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
