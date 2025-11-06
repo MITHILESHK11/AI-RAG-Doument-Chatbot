@@ -53,8 +53,8 @@ for d in (DATA_DIR, DOCS_DIR, IMAGES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # MongoDB Configuration
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = "pdf_knowledge_db"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://User:abc12345678@facedataset.hlmdvpa.mongodb.net/?retryWrites=true&w=majority&appName=FACEDATASET")
+DB_NAME = "FACEDATASET"
 COLLECTIONS = {
     "documents": "documents",
     "chunks": "chunks",
@@ -63,7 +63,7 @@ COLLECTIONS = {
 }
 
 # Milvus Configuration
-MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_URI = os.environ.get("MILVUS_URI", "https://in03-d7d7b3a9345cd47.serverless.aws-eu-central-1.cloud.zilliz.com")
 MILVUS_DB_NAME = "pdf_vectors"
 COLLECTION_NAME = "chunks_collection"
 DIMENSION = 384  # For all-MiniLM-L6-v2
@@ -1060,3 +1060,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
