@@ -1,3 +1,4 @@
 tesseract-ocr
 poppler-utils
 ghostscript
+libgl1
