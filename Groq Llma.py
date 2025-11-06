@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import re
 import requests
+import traceback
 from bs4 import BeautifulSoup
 from PIL import Image
 from PyPDF2 import PdfReader
@@ -228,6 +229,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
