@@ -19,3 +19,4 @@ beautifulsoup4
 pandas
 requests
 opencv-python-headless
+python-dotenv
