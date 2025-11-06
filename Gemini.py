@@ -12,8 +12,9 @@ import uuid
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain_community.chains.question_answering import load_qa_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
+
 
 
 # Set Streamlit page config
@@ -395,6 +396,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
