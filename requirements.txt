@@ -10,3 +10,4 @@ pillow
 pandas
 langchain-community
 langchain-groq
+langchain-huggingface
