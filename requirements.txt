@@ -11,3 +11,8 @@ pandas
 langchain-community
 langchain-groq
 langchain-huggingface
+langchain-core
+langchain-text-splitters
+sentence-transformers
+pytesseract
+
