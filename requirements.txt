@@ -18,3 +18,4 @@ pdfminer.six
 beautifulsoup4
 pandas
 requests
+opencv-python-headless
