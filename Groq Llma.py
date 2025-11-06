@@ -1,9 +1,7 @@
 # ==============================================================================
-# ENTERPRISE PDF → KNOWLEDGE: Advanced Edition with Enhanced Features
-# - Document-specific search/RAG selection
-# - Advanced image extraction with LLM labeling & context awareness
-# - Deep detailed extraction for both scanned & digital PDFs
-# - Improved OCR and context understanding
+# ENTERPRISE PDF → KNOWLEDGE: Enhanced Streamlit Application
+# Full-featured application with MongoDB integration, reprocessing, advanced search,
+# document viewer, benchmarks, and more features from the project plan.
 # ==============================================================================
 
 import streamlit as st
@@ -12,13 +10,13 @@ import re
 import json
 import time
 import traceback
+import hashlib
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import zipfile
-
-# Extraction
+# Extraction libs
 import pdfplumber
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
@@ -27,106 +25,149 @@ import pytesseract
 import cv2
 import numpy as np
 from bs4 import BeautifulSoup
-
+# ML / LLM / embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
-
 import pandas as pd
 import uuid
 import logging
-
-# ==== CONFIG & PATHS ====
+# MongoDB
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
+# ==============================================================================
+# CONFIGURATION & PATHS
+# ==============================================================================
 BASE = Path.cwd()
 DATA_DIR = BASE / "data"
 DOCS_DIR = DATA_DIR / "docs"
-TABLES_DIR = DATA_DIR / "tables"
+TABLES_DIR = DATA_DIR / "tables"  # Legacy, now using Mongo
 IMAGES_DIR = DATA_DIR / "images"
-METADATA_FILE = DATA_DIR / "metadata.json"
 FAISS_DIR = DATA_DIR / "faiss_index"
 AUDIT_LOG = DATA_DIR / "audit.log"
-METRICS_FILE = DATA_DIR / "metrics.json"
-IMAGE_METADATA_FILE = DATA_DIR / "image_metadata.json"
-
-for d in (DATA_DIR, DOCS_DIR, TABLES_DIR, IMAGES_DIR):
+BENCHMARKS_FILE = DATA_DIR / "benchmarks.json"
+for d in (DATA_DIR, DOCS_DIR, IMAGES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# MongoDB Configuration
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME = "pdf_knowledge_db"
+COLLECTIONS = {
+    "documents": "documents",
+    "chunks": "chunks",
+    "tables": "tables",
+    "images": "images"
+}
+
+# Logging configuration
 logger = logging.getLogger("pdf_ingest")
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler(AUDIT_LOG)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-st.set_page_config(page_title="Enterprise PDF → Knowledge Pro", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
+# Streamlit page config
+st.set_page_config(
+    page_title="📚 Enterprise PDF → Knowledge",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ==== ROLE SELECTION (CORRECTED) ====
+# Custom CSS for enhanced UI
+st.markdown("""
+<style>
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; margin-bottom: 1rem; }
+    .card { background-color: #f0f2f6; padding: 1.5rem; border-radius: 0.5rem; border-left: 4px solid #1f77b4; margin-bottom: 1rem; }
+    .metric { text-align: center; padding: 1rem; background: white; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .status-badge { display: inline-block; padding: 0.5rem 1rem; border-radius: 1rem; font-size: 0.9rem; font-weight: bold; margin: 0.25rem; }
+    .status-success { background-color: #d4edda; color: #155724; }
+    .status-warning { background-color: #fff3cd; color: #856404; }
+    .status-error { background-color: #f8d7da; color: #721c24; }
+    .section-title { font-size: 1.8rem; font-weight: bold; color: #1f77b4; margin: 1.5rem 0 1rem 0; border-bottom: 2px solid #1f77b4; padding-bottom: 0.5rem; }
+    .citation { background-color: #e7f3ff; padding: 0.5rem; border-left: 3px solid #1f77b4; margin: 0.5rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# MONGO HELPER FUNCTIONS
+# ==============================================================================
+@st.cache_resource
+def get_mongo_client():
+    try:
+        client = MongoClient(MONGO_URI)
+        client.admin.command('ping')
+        db = client[DB_NAME]
+        return db
+    except ConnectionFailure:
+        st.error("❌ MongoDB connection failed. Using file-based fallback.")
+        return None
+
+def get_collection(db, coll_name):
+    if db is None:
+        return None
+    return db[COLLECTIONS.get(coll_name, coll_name)]
+
+def load_documents_from_mongo(db):
+    coll = get_collection(db, "documents")
+    if coll:
+        return list(coll.find({}, {"_id": 0}))
+    return []
+
+def save_document_to_mongo(db, doc_data):
+    coll = get_collection(db, "documents")
+    if coll:
+        coll.insert_one(doc_data)
+
+def update_document_in_mongo(db, doc_id, updates):
+    coll = get_collection(db, "documents")
+    if coll:
+        coll.update_one({"doc_id": doc_id}, {"$set": updates})
+
+def delete_document_from_mongo(db, doc_id):
+    coll = get_collection(db, "documents")
+    if coll:
+        coll.delete_one({"doc_id": doc_id})
+        # Cascade delete chunks, tables, images
+        for c in ["chunks", "tables", "images"]:
+            get_collection(db, c).delete_many({"doc_id": doc_id})
+
+# ==============================================================================
+# SESSION STATE & AUTHENTICATION
+# ==============================================================================
 if 'user_role' not in st.session_state:
-    st.session_state.user_role = 'viewer'
-role_options = ["viewer", "editor", "admin"]
-selected_role = st.sidebar.selectbox("Role:", role_options, index=role_options.index(st.session_state.user_role))
-st.session_state.user_role = selected_role
-st.sidebar.write(f"Status: {st.session_state.user_role.upper()}")
+    st.session_state.user_role = 'viewer'  # viewer, editor, admin
+if 'search_results' not in st.session_state:
+    st.session_state.search_results = []
+if 'selected_doc' not in st.session_state:
+    st.session_state.selected_doc = None
+if 'db' not in st.session_state:
+    st.session_state.db = get_mongo_client()
 
-def check_permission(required_role: str) -> bool:
-    roles = {'viewer': 1, 'editor': 2, 'admin': 3}
-    return roles.get(st.session_state.user_role, 0) >= roles.get(required_role, 0)
+# ==============================================================================
+# HELPER FUNCTIONS (Enhanced)
+# ==============================================================================
+def make_doc_id() -> str:
+    return str(uuid.uuid4())[:12]
 
-# ==== HELPER FUNCTIONS ====
-def load_metadata() -> Dict:
-    if METADATA_FILE.exists():
-        try: return json.loads(METADATA_FILE.read_text(encoding="utf8"))
-        except: return {}
-    return {}
-
-def save_metadata(meta: Dict):
-    METADATA_FILE.write_text(json.dumps(meta, indent=2), encoding="utf8")
-
-def load_image_metadata() -> Dict:
-    if IMAGE_METADATA_FILE.exists():
-        try: return json.loads(IMAGE_METADATA_FILE.read_text(encoding="utf8"))
-        except: return {}
-    return {}
-
-def save_image_metadata(meta: Dict):
-    IMAGE_METADATA_FILE.write_text(json.dumps(meta, indent=2), encoding="utf8")
+def safe_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return re.sub(r'[\ud800-\udfff]', '', s)
 
 def audit_log(action: str, details: str = ""):
     timestamp = datetime.now().isoformat()
     logger.info(f"ACTION: {action} | ROLE: {st.session_state.user_role} | DETAILS: {details}")
 
-def make_doc_id() -> str:
-    return str(uuid.uuid4())[:12]
-
-def safe_text(s: Optional[str]) -> str:
-    return re.sub(r'[\ud800-\udfff]', '', s) if s else ""
-
-# ==== ADVANCED IMAGE PREPROCESSING ====
-def preprocess_image_for_ocr(pil_img: Image.Image, enhancement_level: int = 2) -> Image.Image:
-    """Advanced preprocessing for scanned & low-quality images"""
+def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    
-    # Convert to grayscale
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    
-    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
-    
-    # Multi-level noise reduction
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
-    gray = cv2.medianBlur(gray, 5)
-    
-    # Advanced thresholding
-    if enhancement_level >= 2:
-        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
-    else:
-        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # Deskewing
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
     coords = np.column_stack(np.where(th > 0))
-    if coords.size > 100:
+    if coords.size:
         angle = cv2.minAreaRect(coords)[-1]
         if angle < -45:
             angle = -(90 + angle)
@@ -137,102 +178,47 @@ def preprocess_image_for_ocr(pil_img: Image.Image, enhancement_level: int = 2) -
             center = (w // 2, h // 2)
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
             th = cv2.warpAffine(th, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    
-    # Morphological operations to clean up
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-    
     return Image.fromarray(th)
 
-def is_scanned_pdf(file_bytes: bytes) -> bool:
-    """Detect if PDF is scanned (image-based) vs digital text"""
+def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[List[str], List[Dict]]:
+    pages = []
+    toc = []
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            text_pages = 0
             for page in pdf.pages:
                 txt = page.extract_text() or ""
-                if len(txt.strip()) > 50:
-                    text_pages += 1
-            scanned_ratio = (len(pdf.pages) - text_pages) / len(pdf.pages)
-            return scanned_ratio > 0.3
-    except:
-        return True
-
-# ==== ADVANCED TEXT EXTRACTION WITH CONTEXT ====
-def extract_text_pdf_advanced(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Advanced extraction returning detailed page data with:
-    - Page type (digital/scanned)
-    - Text position
-    - Surrounding text for images
-    """
-    pages_data = []
-    toc = []
-    is_scanned = is_scanned_pdf(file_bytes)
-    
-    try:
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                txt = page.extract_text() or ""
                 txt = safe_text(txt)
-                
-                # Extract detailed page info
-                page_info = {
-                    "page_num": page_num,
-                    "text": txt,
-                    "is_scanned": is_scanned if not txt.strip() else False,
-                    "text_objects": page.extract_text_lines() if hasattr(page, 'extract_text_lines') else [],
-                    "char_count": len(txt),
-                    "word_count": len(txt.split()),
-                }
-                pages_data.append(page_info)
-        
-        # Extract TOC
+                pages.append(txt)
         try:
             reader = PdfReader(BytesIO(file_bytes))
-            toc = []
-            for item in getattr(reader, "outline", []):
-                try:
-                    title = str(getattr(item, "title", item))
-                    toc.append(title)
-                except:
-                    continue
+            outline = reader.outline
+            toc = [{"title": str(getattr(item, "title", str(item))), "page": 1} for item in outline if hasattr(item, 'title')]
         except:
             toc = []
-    except Exception as e:
-        logger.error(f"Primary PDF extraction failed: {e}")
-    
-    # OCR fallback for scanned pages
-    if use_ocr_if_empty and any(not p["text"].strip() for p in pages_data):
+    except:
+        try:
+            reader = PdfReader(BytesIO(file_bytes))
+            pages = [safe_text(page.extract_text() or "") for page in reader.pages]
+        except:
+            pages = []
+    if use_ocr_if_empty and any(not p.strip() for p in pages):
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            for i, page_data in enumerate(pages_data):
-                if page_data["text"].strip():
+            for i in range(len(doc)):
+                if pages[i].strip():
                     continue
-                
                 page = doc.load_page(i)
-                zoom = 3  # Higher resolution for better OCR
+                zoom = 2
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                pre = preprocess_image_for_ocr(img, enhancement_level=2)
-                
-                try:
-                    ocr_text = pytesseract.image_to_string(pre, lang='eng')
-                    page_data["text"] = safe_text(ocr_text)
-                    page_data["is_scanned"] = True
-                except pytesseract.pytesseract.TesseractNotFoundError:
-                    page_data["text"] = ""
-        except Exception as e:
-            logger.warning(f"OCR fallback failed: {e}")
-    
-    # Clean and postprocess all text
-    cleaned_data = []
-    for page_data in pages_data:
-        page_data["text"] = postprocess_extracted_text(page_data["text"])
-        cleaned_data.append(page_data)
-    
-    return cleaned_data, toc
+                pre = preprocess_image_for_ocr(img)
+                ocr_text = pytesseract.image_to_string(pre, lang='eng')
+                pages[i] = safe_text(ocr_text)
+        except:
+            pass
+    cleaned_pages = [postprocess_extracted_text(p) for p in pages]
+    return cleaned_pages, toc
 
 def dehyphenate(text: str) -> str:
     text = re.sub(r'-\s*\n\s*', '', text)
@@ -254,114 +240,43 @@ def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
-                try:
-                    tables = page.extract_tables()
-                    for t in tables:
-                        if not t or len(t) < 2:
-                            continue
-                        header = [safe_text(c) for c in t[0]]
-                        rows = []
-                        for r in t[1:]:
-                            rowd = {}
-                            for j, cell in enumerate(r):
-                                key = header[j] if j < len(header) else f"col_{j}"
-                                rowd[str(key or j)] = safe_text(cell)
-                            rows.append(rowd)
-                        tables_all.append({"page": i, "header": header, "rows": rows})
-                except:
-                    continue
+                tables = page.extract_tables()
+                for t in tables:
+                    if not t or len(t) < 2:
+                        continue
+                    header = [safe_text(c) for c in t[0]]
+                    rows = []
+                    for r in t[1:]:
+                        rowd = {header[j] if j < len(header) else f"col_{j}": safe_text(cell) for j, cell in enumerate(r)}
+                        rows.append(rowd)
+                    tables_all.append({"page": i, "header": header, "rows": rows})
     except:
         pass
     return tables_all
 
-# ==== ADVANCED IMAGE EXTRACTION WITH CONTEXT & LLM LABELING ====
-def extract_images_pdf_with_context(file_bytes: bytes, doc_id: str, groq_api_key: str = None) -> List[Dict]:
-    """
-    Extract images with:
-    - Surrounding text context
-    - LLM-generated intelligent labels
-    - Page content analysis
-    """
+def extract_images_pdf(file_bytes: bytes, doc_id: str) -> List[Dict]:
     imgs = []
-    page_texts = {}
-    
-    try:
-        # First, get all page texts for context
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                page_texts[page_num] = page.extract_text() or ""
-    except:
-        pass
-    
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         for page_i in range(len(doc)):
             page = doc[page_i]
             image_list = page.get_images(full=True)
-            
             for img_index, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    ext = base_image.get("ext", "png")
-                    img_name = f"{doc_id}_p{page_i+1}_img{img_index}.{ext}"
-                    img_path = IMAGES_DIR / img_name
-                    img_path.write_bytes(image_bytes)
-                    
-                    # Get surrounding context text
-                    page_context = page_texts.get(page_i, "")
-                    
-                    # Generate OCR-based caption
-                    try:
-                        pil = Image.open(BytesIO(image_bytes)).convert("RGB")
-                        ocr_caption = pytesseract.image_to_string(preprocess_image_for_ocr(pil), lang='eng').strip()
-                        if not ocr_caption:
-                            ocr_caption = "(Image - no OCR text detected)"
-                    except:
-                        ocr_caption = "(OCR unavailable)"
-                    
-                    # Generate LLM label (intelligent description)
-                    llm_label = ""
-                    if groq_api_key and ocr_caption and ocr_caption != "(Image - no OCR text detected)":
-                        try:
-                            llm_label = generate_image_label(ocr_caption, page_context, groq_api_key)
-                        except Exception as e:
-                            logger.warning(f"LLM labeling failed: {e}")
-                            llm_label = f"Image context: {page_context[:100]}..."
-                    
-                    imgs.append({
-                        "file": str(img_path),
-                        "page": page_i + 1,
-                        "ocr_caption": ocr_caption,
-                        "llm_label": llm_label,
-                        "context": page_context[:200] if page_context else "(No surrounding text)",
-                        "id": f"img_{doc_id}_{img_index}"
-                    })
-                except Exception as e:
-                    logger.error(f"Error processing image {img_index}: {e}")
-                    continue
-    except Exception as e:
-        logger.error(f"Image extraction failed: {e}")
-    
-    return imgs
-
-def generate_image_label(ocr_text: str, context: str, groq_api_key: str) -> str:
-    """Use LLM to generate intelligent image labels"""
-    prompt = f"""Based on the OCR text from an image and its surrounding context, 
-    provide a concise 1-2 sentence label describing what this image likely depicts:
-    
-    OCR Text: {ocr_text[:300]}
-    Context: {context[:300]}
-    
-    Label:"""
-    
-    try:
-        model = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.3, api_key=groq_api_key)
-        res = model.invoke(prompt)
-        return res.content[:200] if hasattr(res, 'content') else str(res)[:200]
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                ext = base_image.get("ext", "png")
+                img_name = f"{doc_id}_p{page_i+1}_img{img_index}.{ext}"
+                p = IMAGES_DIR / img_name
+                p.write_bytes(image_bytes)
+                pil = Image.open(BytesIO(image_bytes)).convert("RGB")
+                caption = pytesseract.image_to_string(preprocess_image_for_ocr(pil), lang='eng').strip()
+                if not caption:
+                    caption = "Image (no OCR text) — visual content"
+                imgs.append({"file": str(p), "page": page_i + 1, "caption": caption, "id": f"img_{doc_id}_{img_index}"})
     except:
-        return f"Image with text: {ocr_text[:50]}..."
+        pass
+    return imgs
 
 def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
     headings = []
@@ -379,44 +294,29 @@ def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
         pos += len(line) + 1
     return headings
 
-def chunk_document_pages_advanced(pages_data: List[Dict], doc_meta: Dict) -> Tuple[List[str], List[Dict]]:
-    """Advanced chunking preserving page context and scanned vs digital info"""
-    page_marker_texts = []
-    for page_data in pages_data:
-        page_num = page_data["page_num"]
-        text = page_data["text"]
-        is_scanned = page_data.get("is_scanned", False)
-        marker = f"[Page {page_num}{'_SCANNED' if is_scanned else ''}]\n{text}"
-        page_marker_texts.append(marker)
-    
+def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], List[Dict]]:
+    page_marker_texts = [f"[Page {i+1}]\n{p}" for i, p in enumerate(pages)]
     full_text = "\n\n".join(page_marker_texts)
     headings = detect_headings_in_page(full_text)
-    
     chunks = []
     if headings:
-        sections = re.split(r'\n\s*\n', full_text)
-        for sec in sections:
-            sec = sec.strip()
-            if sec:
-                chunks.append(sec)
+        # Simple split by headings
+        for start, heading in headings:
+            # Approximate split (enhanced heuristic)
+            end = full_text.find('\n\n', start + len(heading) + 10)
+            chunk = full_text[start:end] if end > 0 else full_text[start:]
+            if chunk.strip():
+                chunks.append(chunk)
     else:
         chunks = [s.strip() for s in re.split(r'\n\s*\n', full_text) if s.strip()]
-    
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
     final_chunks = []
     metadatas = []
-    
     for i, c in enumerate(chunks):
-        if len(c) < 1500:
+        if len(c) < 1200:
             final_chunks.append(c)
-            md = {
-                "doc_id": doc_meta["doc_id"],
-                "page": None,
-                "paragraph": i+1,
-                "source": doc_meta["file_name"],
-                "is_scanned": "SCANNED" in c
-            }
-            m = re.search(r'\[Page (\d+)', c)
+            md = {"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]}
+            m = re.search(r'\[Page (\d+)\]', c)
             if m:
                 md["page"] = int(m.group(1))
             metadatas.append(md)
@@ -424,18 +324,11 @@ def chunk_document_pages_advanced(pages_data: List[Dict], doc_meta: Dict) -> Tup
             sub = splitter.split_text(c)
             for j, s in enumerate(sub):
                 final_chunks.append(s)
-                md = {
-                    "doc_id": doc_meta["doc_id"],
-                    "page": None,
-                    "paragraph": i+1,
-                    "source": doc_meta["file_name"],
-                    "is_scanned": "SCANNED" in s
-                }
-                m = re.search(r'\[Page (\d+)', s)
+                md = {"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]}
+                m = re.search(r'\[Page (\d+)\]', s)
                 if m:
                     md["page"] = int(m.group(1))
                 metadatas.append(md)
-    
     return final_chunks, metadatas
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -447,63 +340,39 @@ def build_or_load_faiss(chunks: List[str], metadatas: List[Dict]):
             db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
             if chunks:
                 db.add_texts(chunks, metadatas=metadatas)
-                try:
-                    db.save_local(str(FAISS_DIR))
-                except:
-                    pass
+                db.save_local(str(FAISS_DIR))
             return db
     except:
         pass
-    
     if not chunks:
         chunks = [""]
-        metadatas = [{"doc_id":"dummy","page":0,"paragraph":0,"source":"none","is_scanned":False}]
-    
+        metadatas = [{"doc_id":"dummy","page":0,"paragraph":0,"source":"none"}]
     db = FAISS.from_texts(chunks, embedding=embed, metadatas=metadatas)
-    try:
-        db.save_local(str(FAISS_DIR))
-    except:
-        pass
+    db.save_local(str(FAISS_DIR))
     return db
 
 QA_PROMPT = """You are an accurate document question-answering assistant.
-Use ONLY the provided context to answer the question. Provide clear, detailed answers with citations:
-(Document: [SOURCE], Page: [PAGE], Context: [TYPE])
-
+Use ONLY the provided context to answer the question. Provide bullet points and cite every claim as:
+(Document ID: [ID], Page: [X], Section: [Y], Source: [Source]).
+If the answer cannot be found in the context, respond EXACTLY: "Answer is not available in the context."
 Context:
 {context}
-
 Question:
 {question}
-
 Answer:
 """
 
-def ask_groq_with_docs(docs, question, doc_filter=None, model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=None):
-    """Get answer with optional document filtering"""
+def ask_groq_with_docs(docs, question, model_name="llama3-70b-8192", temperature=0.2, groq_api_key=None):
     parts = []
-    filtered_docs = []
-    
-    # Filter by document if specified
-    if doc_filter and doc_filter != "All Documents":
-        filtered_docs = [d for d in docs if d.metadata.get('source', '') == doc_filter]
-        if not filtered_docs:
-            filtered_docs = docs
-    else:
-        filtered_docs = docs
-    
-    for d in filtered_docs:
-        content = getattr(d, "page_content", d.get("page_content") if isinstance(d, dict) else str(d))
-        meta = getattr(d, "metadata", d.get("metadata") if isinstance(d, dict) else {})
-        doc_type = "Scanned" if meta.get("is_scanned") else "Digital"
-        header = f"(Document: {meta.get('source','NA')}, Page: {meta.get('page','NA')}, Type: {doc_type})"
-        snippet = content if len(content) < 2000 else content[:1900] + "..."
+    for d in docs:
+        content = getattr(d, "page_content", str(d))
+        meta = getattr(d, "metadata", {})
+        header = f"(Document ID: {meta.get('doc_id','NA')}, Page: {meta.get('page','NA')}, Section: {meta.get('section_title','NA')}, Source: {meta.get('source','NA')})"
+        snippet = content[:1900] + "..." if len(content) > 1900 else content
         parts.append(header + "\n" + snippet)
-    
     context = "\n\n---\n\n".join(parts)
     prompt = PromptTemplate.from_template(QA_PROMPT)
     formatted = prompt.format(context=context, question=question)
-    
     model = ChatGroq(model_name=model_name, temperature=temperature, api_key=groq_api_key or os.environ.get("GROQ_API_KEY"))
     try:
         res = model.invoke(formatted)
@@ -511,247 +380,607 @@ def ask_groq_with_docs(docs, question, doc_filter=None, model_name="llama-3.3-70
     except Exception as e:
         return f"LLM error: {e}"
 
-# ==== PAGE FUNCTIONS ====
+def load_benchmarks():
+    if BENCHMARKS_FILE.exists():
+        try:
+            return json.loads(BENCHMARKS_FILE.read_text(encoding="utf8"))
+        except:
+            return {}
+    return {"ingestion_times": [], "query_times": [], "extraction_accuracy": []}
+
+def save_benchmarks(bench: Dict):
+    try:
+        BENCHMARKS_FILE.write_text(json.dumps(bench, indent=2), encoding="utf8")
+    except:
+        pass
+
+# ==============================================================================
+# UI: ROLE-BASED ACCESS CONTROL (Enhanced)
+# ==============================================================================
+def show_user_panel():
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("👤 User Role & Access")
+    role_options = ['viewer', 'editor', 'admin']
+    st.session_state.user_role = st.sidebar.selectbox(
+        "Select Role",
+        role_options,
+        index=role_options.index(st.session_state.user_role),
+        help="Viewer = read-only, Editor = upload/edit, Admin = full control."
+    )
+    st.sidebar.markdown(f"**🧭 Current Role:** `{st.session_state.user_role.upper()}`")
+
+def check_permission(required_role: str) -> bool:
+    roles = {'viewer': 1, 'editor': 2, 'admin': 3}
+    return roles.get(st.session_state.user_role, 0) >= roles.get(required_role, 0)
+
+# ==============================================================================
+# PAGES: ENHANCED UI COMPONENTS
+# ==============================================================================
+def page_dashboard():
+    st.markdown('<h2 class="section-title">📊 Dashboard</h2>', unsafe_allow_html=True)
+    db = st.session_state.db
+    docs = load_documents_from_mongo(db)
+    benchmarks = load_benchmarks()
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.markdown('<div class="metric">', unsafe_allow_html=True)
+        st.metric("Total Documents", len(docs))
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col2:
+        total_pages = sum(d.get('pages', 0) for d in docs)
+        st.markdown('<div class="metric">', unsafe_allow_html=True)
+        st.metric("Total Pages", total_pages)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col3:
+        total_tables = sum(d.get('tables', 0) for d in docs)
+        st.markdown('<div class="metric">', unsafe_allow_html=True)
+        st.metric("Total Tables", total_tables)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col4:
+        total_images = sum(d.get('images', 0) for d in docs)
+        st.markdown('<div class="metric">', unsafe_allow_html=True)
+        st.metric("Total Images", total_images)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col5:
+        avg_time = sum(benchmarks.get('ingestion_times', [])) / len(benchmarks.get('ingestion_times', [])) if benchmarks.get('ingestion_times') else 0
+        st.markdown('<div class="metric">', unsafe_allow_html=True)
+        st.metric("Avg Ingest Time", f"{avg_time:.2f}s")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Recent uploads
+    st.markdown("### Recent Uploads")
+    if docs:
+        recent = sorted(docs, key=lambda x: x.get('uploaded_at', 0), reverse=True)[:5]
+        for doc in recent:
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                status = doc.get('status', 'processed')
+                badge_class = "status-success" if status == "processed" else "status-warning" if status == "processing" else "status-error"
+                st.markdown(f'<span class="status-badge {badge_class}">{status.upper()}</span> {doc["file_name"]}', unsafe_allow_html=True)
+            with col2:
+                st.caption(f"Pages: {doc.get('pages', 'N/A')}")
+            with col3:
+                ts = datetime.fromtimestamp(doc.get('uploaded_at', 0)).strftime('%m/%d')
+                st.caption(ts)
+    else:
+        st.info("No documents uploaded yet.")
 
 def page_upload():
-    st.header("📤 Advanced PDF Upload & Ingest")
+    st.markdown('<h2 class="section-title">📤 Upload & Ingest PDFs</h2>', unsafe_allow_html=True)
+
     if not check_permission('editor'):
-        st.error("Need editor permissions to upload."); return
-    
+        st.error("❌ You need editor permissions to upload documents.")
+        return
+
+    db = st.session_state.db
     col1, col2 = st.columns([2, 1])
     with col1:
-        department = st.text_input("Department/Tag (optional)")
+        department = st.text_input("📁 Department / Tag (optional)", placeholder="e.g., Finance, HR")
     with col2:
-        use_ocr = st.checkbox("Enable OCR", value=True)
-    
-    uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-    use_llm_labels = st.checkbox("Use LLM for intelligent image labels (requires API key)", value=False)
-    
-    if st.button("🚀 Ingest Files", type="primary"):
+        language = st.selectbox("🌐 Language", ["en", "other"])
+        use_ocr = st.checkbox("Use OCR for scanned PDFs", value=True)
+
+    uploaded_files = st.file_uploader("📎 Upload PDF files", type=["pdf"], accept_multiple_files=True)
+
+    if st.button("🚀 Ingest Selected Files", type="primary"):
         if not uploaded_files:
-            st.warning("Select PDFs to upload."); return
-        
-        metadata = load_metadata()
-        progress = st.progress(0)
-        status_text = st.empty()
-        total = len(uploaded_files)
-        
-        for count, f in enumerate(uploaded_files):
-            status_text.text(f"Processing {f.name}... ({count+1}/{total})")
-            try:
-                raw = f.read()
-                doc_id = make_doc_id()
-                fname = f"{doc_id}_{f.name}"
-                (DOCS_DIR / fname).write_bytes(raw)
-                
-                # Advanced extraction
-                pages_data, toc = extract_text_pdf_advanced(raw, use_ocr_if_empty=use_ocr)
-                tables = extract_tables_pdf(raw)
-                
-                # Extract images with LLM labels
-                groq_key = os.environ.get("GROQ_API_KEY") if use_llm_labels else None
-                images = extract_images_pdf_with_context(raw, doc_id, groq_api_key=groq_key)
-                
-                doc_meta = {
-                    "doc_id": doc_id,
-                    "file_name": fname,
-                    "uploaded_at": time.time(),
-                    "toc": toc,
-                    "department": department,
-                    "is_scanned": is_scanned_pdf(raw),
-                    "pages_count": len(pages_data)
-                }
-                
-                chunks, ch_meta = chunk_document_pages_advanced(pages_data, doc_meta)
-                db = build_or_load_faiss(chunks, ch_meta)
-                
-                if tables:
-                    (TABLES_DIR / f"{doc_id}_tables.json").write_text(json.dumps(tables, indent=2), encoding="utf8")
-                
-                if images:
-                    img_meta = load_image_metadata()
-                    img_meta[doc_id] = images
-                    save_image_metadata(img_meta)
-                
-                metadata[doc_id] = {
-                    "doc_id": doc_id,
-                    "file_name": fname,
-                    "pages": len(pages_data),
-                    "toc": toc,
-                    "tables": len(tables),
-                    "images": len(images),
-                    "uploaded_at": time.time(),
-                    "is_scanned": is_scanned_pdf(raw)
-                }
-                save_metadata(metadata)
-                audit_log("UPLOAD", f"Uploaded {f.name} (ID: {doc_id})")
-                st.success(f"✅ Ingested {f.name}")
-            except Exception as e:
-                st.error(f"❌ Failed {f.name}: {e}")
-                st.exception(traceback.format_exc())
-            
-            progress.progress((count+1)/total)
-        
-        st.balloons()
+            st.warning("Please select PDFs to upload.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            total = len(uploaded_files)
+            benchmarks = load_benchmarks()
 
-def page_images():
-    st.header("🖼️ Advanced Image Gallery")
-    img_meta = load_image_metadata()
-    
-    if not img_meta:
-        st.info("No images extracted yet."); return
-    
-    for doc_id, images in img_meta.items():
-        st.subheader(f"Images from Document: {doc_id}")
-        
-        cols = st.columns(3)
-        for i, img_info in enumerate(images):
-            with cols[i % 3]:
+            for count, f in enumerate(uploaded_files):
+                start_time = time.time()
+                status_text.text(f"Processing {f.name}... ({count+1}/{total})")
+
                 try:
-                    if Path(img_info["file"]).exists():
-                        img = Image.open(img_info["file"])
-                        st.image(img, use_column_width=True)
-                        
-                        with st.expander("📝 Details"):
-                            st.write(f"**Page:** {img_info['page']}")
-                            st.write(f"**OCR Text:** {img_info.get('ocr_caption', 'N/A')[:100]}")
-                            st.write(f"**LLM Label:** {img_info.get('llm_label', 'N/A')[:150]}")
-                            st.write(f"**Context:** {img_info.get('context', 'N/A')[:100]}")
-                        
-                        with open(img_info["file"], 'rb') as f:
-                            st.download_button("⬇️ Download", f.read(), file_name=Path(img_info["file"]).name)
-                except Exception as e:
-                    st.error(f"Image error: {e}")
+                    raw = f.read()
+                    doc_id = make_doc_id()
+                    fname = f"{doc_id}_{f.name}"
+                    (DOCS_DIR / fname).write_bytes(raw)
 
-def page_search():
-    st.header("🔍 Advanced Search & Q&A")
-    
-    metadata = load_metadata()
-    doc_options = ["All Documents"] + [info.get("file_name", doc_id) for doc_id, info in metadata.items()]
-    
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        query = st.text_input("Search query")
-    with col2:
-        selected_doc = st.selectbox("Filter by document", doc_options)
-    with col3:
-        k = st.slider("Results", 1, 15, 5)
-    
-    tab1, tab2 = st.tabs(["Semantic Search", "Q&A (RAG)"])
-    
-    with tab1:
-        if st.button("Search"):
-            if not query.strip():
-                st.warning("Enter query."); return
-            try:
-                embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                docs = db.similarity_search(query, k=k)
-                
-                # Filter if needed
-                if selected_doc != "All Documents":
-                    docs = [d for d in docs if d.metadata.get("source", "") == selected_doc]
-                
-                st.success(f"Found {len(docs)} results")
-                for i, d in enumerate(docs):
-                    md = d.metadata
-                    snippet = d.page_content[:500]
-                    doc_type = "Scanned" if md.get("is_scanned") else "Digital"
-                    
-                    with st.expander(f"📄 Result {i+1}: {md.get('source')} | Page {md.get('page')} ({doc_type})"):
-                        st.write(snippet)
-            except Exception as e:
-                st.error(f"Search failed: {e}")
-    
-    with tab2:
-        if st.button("Get Answer (RAG)"):
-            if not query.strip():
-                st.warning("Enter question."); return
-            if not os.environ.get("GROQ_API_KEY"):
-                st.error("Set Groq API key."); return
-            
-            try:
-                embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-                db = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
-                docs = db.similarity_search(query, k=k)
-                
-                with st.spinner("🤔 Thinking..."):
-                    ans = ask_groq_with_docs(docs, query, doc_filter=selected_doc, groq_api_key=os.environ.get("GROQ_API_KEY"))
-                
-                st.markdown("### 📝 Answer")
-                st.markdown(ans)
-                
-                with st.expander("📚 Source Documents"):
-                    for d in docs:
-                        md = d.metadata
-                        doc_type = "Scanned" if md.get("is_scanned") else "Digital"
-                        st.write(f"**{md.get('source')}** - Page {md.get('page')}, Type: {doc_type}")
-            except Exception as e:
-                st.error(f"Q&A failed: {e}")
+                    # Update status
+                    doc_meta = {
+                        "doc_id": doc_id,
+                        "file_name": fname,
+                        "uploaded_by": st.session_state.user_role,  # Simple
+                        "uploaded_at": time.time(),
+                        "pages": 0,
+                        "toc": [],
+                        "status": "processing",
+                        "metadata": {"department": department, "language": language},
+                        "blob_path": str(DOCS_DIR / fname)
+                    }
+                    save_document_to_mongo(db, doc_meta)
+                    audit_log("UPLOAD_START", f"Started {f.name} (ID: {doc_id})")
+
+                    pages, toc = extract_text_pdf(raw, use_ocr_if_empty=use_ocr)
+                    tables = extract_tables_pdf(raw)
+                    images = extract_images_pdf(raw, doc_id)
+
+                    extraction_time = time.time() - start_time
+
+                    # Chunk and embed
+                    chunk_start = time.time()
+                    chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname})
+                    db_vec = build_or_load_faiss(chunks, ch_meta)
+                    embedding_time = time.time() - chunk_start
+
+                    # Save to Mongo
+                    doc_meta.update({
+                        "pages": len(pages),
+                        "toc": toc,
+                        "tables": len(tables),
+                        "images": len(images),
+                        "status": "processed",
+                        "extraction_time": extraction_time,
+                        "embedding_time": embedding_time
+                    })
+                    update_document_in_mongo(db, doc_id, doc_meta)
+
+                    # Save chunks, tables, images
+                    chunks_coll = get_collection(db, "chunks")
+                    if chunks_coll:
+                        for i, (chunk, meta) in enumerate(zip(chunks, ch_meta)):
+                            chunks_coll.insert_one({"_id": f"chunk_{doc_id}_{i}", **meta, "text": chunk})
+
+                    tables_coll = get_collection(db, "tables")
+                    if tables_coll and tables:
+                        for t in tables:
+                            t["doc_id"] = doc_id
+                            tables_coll.insert_one(t)
+
+                    images_coll = get_collection(db, "images")
+                    if images_coll and images:
+                        for img in images:
+                            img["doc_id"] = doc_id
+                            images_coll.insert_one(img)
+
+                    # Benchmarks
+                    benchmarks["ingestion_times"].append(extraction_time + embedding_time)
+                    benchmarks["query_times"].append(0)  # Placeholder
+                    save_benchmarks(benchmarks)
+
+                    audit_log("UPLOAD_SUCCESS", f"Completed {f.name} (ID: {doc_id})")
+                    st.success(f"✅ Ingested {f.name}")
+
+                except Exception as e:
+                    error_msg = str(e)
+                    update_document_in_mongo(db, doc_id, {"status": "error", "error": error_msg})
+                    st.error(f"❌ Failed to process {f.name}: {error_msg}")
+                    audit_log("UPLOAD_ERROR", f"Failed {f.name}: {error_msg}")
+
+                progress_bar.progress((count + 1) / total)
+
+            status_text.empty()
+            progress_bar.empty()
+            st.balloons()
 
 def page_documents():
-    st.header("📚 Documents")
-    metadata = load_metadata()
-    
-    if not metadata:
-        st.info("No documents yet."); return
-    
-    for doc_id, info in sorted(metadata.items(), key=lambda x: x[1].get('uploaded_at', 0), reverse=True):
-        doc_type = "🔍 Scanned" if info.get("is_scanned") else "📄 Digital"
-        with st.expander(f"{doc_type} {info.get('file_name')} ({doc_id})"):
+    st.markdown('<h2 class="section-title">📚 Documents</h2>', unsafe_allow_html=True)
+    db = st.session_state.db
+    docs = load_documents_from_mongo(db)
+
+    if not docs:
+        st.info("No documents ingested yet.")
+        return
+
+    # Filter
+    departments = set(d.get('metadata', {}).get('department', '') for d in docs)
+    selected_dept = st.selectbox("Filter by department", ["All"] + sorted(list(departments)))
+
+    for doc in sorted(docs, key=lambda x: x.get('uploaded_at', 0), reverse=True):
+        if selected_dept != "All" and doc.get('metadata', {}).get('department') != selected_dept:
+            continue
+
+        with st.expander(f"📄 {doc['file_name']} ({doc['doc_id']}) - Status: {doc.get('status', 'unknown')}", expanded=False):
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Pages", info.get("pages", "N/A"))
+                st.metric("📄 Pages", doc.get('pages', 'N/A'))
             with col2:
-                st.metric("Tables", info.get("tables", 0))
+                st.metric("📊 Tables", doc.get('tables', 0))
             with col3:
-                st.metric("Images", info.get("images", 0))
-            
-            st.caption(f"⏰ {datetime.fromtimestamp(info.get('uploaded_at', 0)).strftime('%Y-%m-%d %H:%M')}")
+                st.metric("🖼️ Images", doc.get('images', 0))
+
+            st.caption(f"⏰ Uploaded: {datetime.fromtimestamp(doc.get('uploaded_at', 0)).strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Actions
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                if st.button("👁️ View", key=f"view_{doc['doc_id']}"):
+                    st.session_state.selected_doc = doc['doc_id']
+            with col2:
+                if check_permission('editor') and st.button("✏️ Edit Metadata", key=f"edit_{doc['doc_id']}"):
+                    edit_doc_metadata(doc)
+            with col3:
+                if check_permission('editor') and st.button("🔄 Reprocess", key=f"reprocess_{doc['doc_id']}"):
+                    reprocess_document(doc['doc_id'])
+            with col4:
+                if check_permission('admin') and st.button("🗑️ Delete", key=f"delete_{doc['doc_id']}"):
+                    delete_document(doc['doc_id'])
+                    st.rerun()
+
+            # Download
+            fpath = Path(doc["blob_path"])
+            if fpath.exists():
+                with open(fpath, 'rb') as file:
+                    st.download_button(
+                        "📥 Download PDF",
+                        file.read(),
+                        file_name=doc['file_name'],
+                        key=f"dl_{doc['doc_id']}"
+                    )
+
+def edit_doc_metadata(doc):
+    with st.form(key=f"edit_form_{doc['doc_id']}"):
+        department = st.text_input("Department", value=doc.get('metadata', {}).get('department', ''))
+        tags = st.text_area("Tags (comma-separated)", value=','.join(doc.get('metadata', {}).get('tags', [])))
+        if st.form_submit_button("Save"):
+            updates = {"metadata": {"department": department, "tags": tags.split(',') if tags else [], "language": doc.get('metadata', {}).get('language', 'en')}}
+            update_document_in_mongo(st.session_state.db, doc['doc_id'], updates)
+            audit_log("METADATA_EDIT", f"Edited metadata for {doc['doc_id']}")
+            st.success("Metadata updated!")
+            st.rerun()
+
+def reprocess_document(doc_id):
+    # Placeholder for reprocessing logic (re-run extraction)
+    st.info("Reprocessing initiated... (Implementation: re-run extract_text_pdf, chunk, embed)")
+    # TODO: Implement full reprocess
+    audit_log("REPROCESS", f"Reprocessed {doc_id}")
+
+def delete_document(doc_id):
+    db = st.session_state.db
+    delete_document_from_mongo(db, doc_id)
+    # Delete file
+    docs = load_documents_from_mongo(db)
+    for d in docs:
+        if d['doc_id'] == doc_id:
+            fpath = Path(d["blob_path"])
+            if fpath.exists():
+                fpath.unlink()
+            break
+    audit_log("DELETE", f"Deleted {doc_id}")
+    st.success("Document deleted!")
+
+@st.cache_data
+def load_document_view(doc_id):
+    db = st.session_state.db
+    doc = next((d for d in load_documents_from_mongo(db) if d['doc_id'] == doc_id), None)
+    if not doc:
+        return None
+    fpath = Path(doc["blob_path"])
+    if not fpath.exists():
+        return None
+    raw = fpath.read_bytes()
+    pages, _ = extract_text_pdf(raw)
+    return pages, doc
+
+def page_document_viewer():
+    st.markdown('<h2 class="section-title">📖 Document Viewer</h2>', unsafe_allow_html=True)
+    if st.session_state.selected_doc:
+        pages, doc = load_document_view(st.session_state.selected_doc)
+        if pages:
+            selected_page = st.slider("Select Page", 1, len(pages), 1)
+            st.text_area("Page Content", pages[selected_page-1], height=400)
+            # Highlight search (simple)
+            query = st.text_input("Highlight Text")
+            if query:
+                highlighted = pages[selected_page-1].replace(query, f"<mark>{query}</mark>")
+                st.markdown(highlighted, unsafe_allow_html=True)
+        else:
+            st.error("Document not found.")
+
+def page_tables():
+    st.markdown('<h2 class="section-title">📊 Tables</h2>', unsafe_allow_html=True)
+    db = st.session_state.db
+    tables_coll = get_collection(db, "tables")
+    if tables_coll:
+        tables = list(tables_coll.find({}, {"_id": 0}))
+    else:
+        tables = []
+
+    if not tables:
+        st.info("No tables extracted yet.")
+        return
+
+    doc_choices = {d['file_name']: d['doc_id'] for d in load_documents_from_mongo(db)}
+    selected_doc_name = st.selectbox("Select Document", ["All"] + list(doc_choices.keys()))
+
+    for t in tables:
+        doc_id = t['doc_id']
+        if selected_doc_name != "All" and doc_choices.get(selected_doc_name) != doc_id:
+            continue
+
+        with st.expander(f"📊 Table (Page {t['page']}) - Doc: {doc_id}", expanded=False):
+            df = pd.DataFrame(t["rows"])
+
+            if check_permission('editor'):
+                edited_df = st.data_editor(df, use_container_width=True, key=f"table_{t.get('_id', uuid.uuid4())}")
+                if st.button("💾 Save Changes", key=f"save_table_{t.get('_id', uuid.uuid4())}"):
+                    t["rows"] = edited_df.to_dict(orient='records')
+                    tables_coll.update_one({"doc_id": doc_id, "page": t['page']}, {"$set": t})
+                    audit_log("TABLE_EDIT", f"Edited table in {doc_id}")
+                    st.success("✅ Table updated")
+            else:
+                st.dataframe(df, use_container_width=True)
+
+            csv = df.to_csv(index=False)
+            st.download_button("📥 Download CSV", csv, file_name=f"table_page_{t['page']}.csv")
+
+def page_images():
+    st.markdown('<h2 class="section-title">🖼️ Images Gallery</h2>', unsafe_allow_html=True)
+    db = st.session_state.db
+    images_coll = get_collection(db, "images")
+    if images_coll:
+        images = list(images_coll.find({}, {"_id": 0}))
+    else:
+        images = []
+
+    if not images:
+        st.info("No images extracted yet.")
+        return
+
+    cols = st.columns(3)
+    for i, img in enumerate(images):
+        with cols[i % 3]:
+            try:
+                img_path = Path(img["file"])
+                img_pil = Image.open(img_path)
+                st.image(img_pil, use_column_width=True)
+                caption_key = f"caption_{img['id']}"
+                if caption_key not in st.session_state:
+                    st.session_state[caption_key] = img.get('caption', img_path.stem)
+
+                new_caption = st.text_input("Caption", value=st.session_state[caption_key], key=caption_key)
+                if st.button("Update Caption", key=f"update_cap_{img['id']}"):
+                    st.session_state[caption_key] = new_caption
+                    images_coll.update_one({"id": img['id']}, {"$set": {"caption": new_caption}})
+                    audit_log("IMAGE_CAPTION_EDIT", f"Updated caption for {img['id']}")
+                    st.success("Caption updated!")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.caption(f"Page: {img['page']}")
+                with col2:
+                    with open(img_path, 'rb') as f:
+                        st.download_button("⬇️", f.read(), file_name=img_path.name, key=f"dl_img_{img['id']}")
+            except Exception as e:
+                st.error(f"Failed to load image: {e}")
+
+def page_search():
+    st.markdown('<h2 class="section-title">🔍 Search & Q&A</h2>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        query = st.text_input("🔎 Enter your search query", placeholder="Ask anything...")
+    with col2:
+        k = st.slider("Top K Results", 1, 15, 5)
+        search_type = st.selectbox("Search Type", ["Semantic", "Keyword", "Hybrid"])
+
+    tab1, tab2 = st.tabs(["🔍 Search", "🤖 Q&A with RAG"])
+
+    with tab1:
+        if st.button("Search", type="primary"):
+            if not query.strip():
+                st.warning("Enter a query.")
+            else:
+                try:
+                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+                    db_vec = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
+                    if search_type == "Keyword":
+                        # Simple keyword (using FAISS metadata filter if possible, else basic)
+                        docs = db_vec.similarity_search(query, k=k)  # Fallback to semantic
+                    else:
+                        docs = db_vec.similarity_search(query, k=k)
+                    st.session_state.search_results = docs
+
+                    audit_log("SEARCH", f"Query: {query} (Type: {search_type})")
+
+                    st.success(f"Found {len(docs)} results")
+                    for i, d in enumerate(docs):
+                        md = d.metadata
+                        snippet = postprocess_extracted_text(d.page_content)[:500]
+                        with st.expander(f"📄 Result {i+1}: {md.get('source')} (Page {md.get('page')}) - Score: {d.metadata.get('score', 'N/A')}"):
+                            st.write(snippet)
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.caption(f"Doc ID: {md.get('doc_id')}")
+                            with col2:
+                                st.caption(f"Section: {md.get('section_title', 'N/A')}")
+
+                except Exception as e:
+                    st.error(f"Search failed: {e}")
+
+    with tab2:
+        if st.button("Get Answer (RAG)", type="primary"):
+            if not query.strip():
+                st.warning("Enter a question.")
+            elif not os.environ.get("GROQ_API_KEY"):
+                st.error("❌ Set Groq API key in sidebar.")
+            else:
+                try:
+                    embed = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+                    db_vec = FAISS.load_local(str(FAISS_DIR), embed, allow_dangerous_deserialization=True)
+                    docs = db_vec.similarity_search(query, k=k)
+
+                    with st.spinner("🤔 Thinking..."):
+                        start_q = time.time()
+                        ans = ask_groq_with_docs(docs, query, groq_api_key=os.environ.get("GROQ_API_KEY"))
+                        q_time = time.time() - start_q
+                        benchmarks = load_benchmarks()
+                        benchmarks["query_times"].append(q_time)
+                        save_benchmarks(benchmarks)
+
+                    audit_log("QA", f"Query: {query}")
+
+                    st.markdown("### 📝 Answer")
+                    st.markdown(ans)
+
+                    # Parse and highlight citations
+                    citations = re.findall(r'\(Document ID: \[([^\]]+)\], Page: \[([^\]]+)\]', ans)
+                    with st.expander("📚 Sources"):
+                        for cit in citations:
+                            st.markdown(f'<div class="citation">Doc ID: {cit[0]}, Page: {cit[1]}</div>', unsafe_allow_html=True)
+
+                except Exception as e:
+                    st.error(f"QA failed: {e}")
+
+def page_benchmarks():
+    st.markdown('<h2 class="section-title">📈 Performance Benchmarks</h2>', unsafe_allow_html=True)
+    benchmarks = load_benchmarks()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Avg Ingestion Time", f"{sum(benchmarks.get('ingestion_times', []))/len(benchmarks.get('ingestion_times', [])):.2f}s" if benchmarks.get('ingestion_times') else "N/A")
+    with col2:
+        st.metric("Avg Query Time", f"{sum(benchmarks.get('query_times', []))/len(benchmarks.get('query_times', [])):.2f}s" if benchmarks.get('query_times') else "N/A")
+    with col3:
+        st.metric("Extraction Accuracy", f"{sum(benchmarks.get('extraction_accuracy', []))/len(benchmarks.get('extraction_accuracy', [])):.1%}" if benchmarks.get('extraction_accuracy') else "N/A")
+
+    st.line_chart({"Ingestion Times": benchmarks.get('ingestion_times', [])})
 
 def page_admin():
-    st.header("⚙️ Admin Panel")
+    st.markdown('<h2 class="section-title">⚙️ Admin Panel</h2>', unsafe_allow_html=True)
+
     if not check_permission('admin'):
-        st.error("Need admin permissions."); return
-    
-    if st.button("🔄 Rebuild FAISS"):
-        try:
-            metadata = load_metadata()
-            all_chunks, all_meta = [], []
-            for doc_id, info in metadata.items():
-                fpath = DOCS_DIR / info["file_name"]
-                if not fpath.exists():
-                    continue
-                raw = fpath.read_bytes()
-                pages_data, _ = extract_text_pdf_advanced(raw)
-                chunks, ch_meta = chunk_document_pages_advanced(pages_data, {"doc_id": doc_id, "file_name": info["file_name"]})
-                all_chunks += chunks
-                all_meta += ch_meta
-            
-            build_or_load_faiss(all_chunks, all_meta)
-            st.success("✅ FAISS rebuilt")
-        except Exception as e:
-            st.error(f"Failed: {e}")
+        st.error("❌ Admin permissions required.")
+        return
 
-# ==== MAIN ====
-st.sidebar.title("📚 PDF Knowledge Pro")
+    tab1, tab2, tab3, tab4 = st.tabs(["🔧 Management", "📈 Benchmarks", "🔐 Audit Log", "📥 Backup"])
 
-groq_key = st.sidebar.text_input("Groq API Key", type="password")
-if groq_key:
-    os.environ["GROQ_API_KEY"] = groq_key
+    with tab1:
+        st.subheader("System Management")
+        if st.button("🔄 Rebuild FAISS Index"):
+            with st.spinner("Rebuilding..."):
+                db = st.session_state.db
+                docs = load_documents_from_mongo(db)
+                all_chunks, all_meta = [], []
+                for doc in docs:
+                    fpath = Path(doc["blob_path"])
+                    if fpath.exists():
+                        raw = fpath.read_bytes()
+                        pages, _ = extract_text_pdf(raw)
+                        chunks, ch_meta = chunk_document_pages(pages, doc)
+                        all_chunks += chunks
+                        all_meta += ch_meta
+                build_or_load_faiss(all_chunks, all_meta)
+                st.success("✅ Index rebuilt")
 
-page = st.sidebar.radio("Page", ["Upload", "Documents", "Images", "Search", "Admin"])
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Docs in Mongo", len(load_documents_from_mongo(st.session_state.db)))
+        with col2:
+            st.metric("Tables in Mongo", len(list(get_collection(st.session_state.db, "tables").find())))
+        with col3:
+            st.metric("Images", len(list(IMAGES_DIR.glob("*"))))
 
-if page == "Upload":
-    page_upload()
-elif page == "Documents":
-    page_documents()
-elif page == "Images":
-    page_images()
-elif page == "Search":
-    page_search()
-elif page == "Admin":
-    page_admin()
+    with tab2:
+        page_benchmarks()
 
-st.markdown("---")
-st.markdown("Built with ❤️ | Advanced OCR + Deep Extraction + LLM Image Labeling + Filtered RAG")
+    with tab3:
+        st.subheader("Audit Log")
+        if AUDIT_LOG.exists():
+            log_content = AUDIT_LOG.read_text()[-2000:]
+            st.text_area("Recent Activity", log_content, height=300, disabled=True)
+        else:
+            st.info("No logs yet.")
+
+    with tab4:
+        st.subheader("Backup & Export")
+        if st.button("📦 Create Full Backup (ZIP)"):
+            zip_path = DATA_DIR / f"backup_{datetime.now().strftime('%Y%m%d')}.zip"
+            with zipfile.ZipFile(zip_path, "w") as z:
+                for f in DOCS_DIR.glob("*"):
+                    z.write(f, arcname=f"docs/{f.name}")
+                for f in IMAGES_DIR.glob("*"):
+                    z.write(f, arcname=f"images/{f.name}")
+                # Export Mongo data
+                db = st.session_state.db
+                if db:
+                    for coll_name, mongo_coll in COLLECTIONS.items():
+                        coll = get_collection(db, mongo_coll)
+                        data = list(coll.find({}, {"_id": 0}))
+                        json_file = DATA_DIR / f"{coll_name}.json"
+                        json_file.write_text(json.dumps(data, indent=2))
+                        z.write(json_file, arcname=f"mongo/{coll_name}.json")
+
+            with open(zip_path, "rb") as f:
+                st.download_button("📥 Download Backup", f.read(), file_name=zip_path.name)
+
+# ==============================================================================
+# MAIN APP
+# ==============================================================================
+def main():
+    st.sidebar.title("📚 Enterprise PDF → Knowledge")
+    st.sidebar.markdown("Enhanced with MongoDB, reprocessing, viewer, benchmarks")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧭 Navigation")
+    page = st.sidebar.radio(
+        "Select Page",
+        ["Dashboard", "Upload & Ingest", "Documents", "Document Viewer", "Tables", "Images", "Search & Q&A", "Benchmarks", "Admin"]
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ Configuration")
+    groq_key = st.sidebar.text_input("Groq API Key", type="password", placeholder="sk-...")
+    if groq_key:
+        os.environ["GROQ_API_KEY"] = groq_key
+        st.sidebar.caption("✅ Set")
+    mongo_uri = st.sidebar.text_input("Mongo URI", value=MONGO_URI, type="password")
+    if mongo_uri != MONGO_URI:
+        os.environ["MONGO_URI"] = mongo_uri
+        st.session_state.db = get_mongo_client()  # Refresh
+        st.sidebar.caption("🔄 Reconnect")
+
+    show_user_panel()
+
+    st.markdown('<h1 class="main-header">📚 Enterprise PDF → Knowledge Hub</h1>', unsafe_allow_html=True)
+
+    if page == "Dashboard":
+        page_dashboard()
+    elif page == "Upload & Ingest":
+        page_upload()
+    elif page == "Documents":
+        page_documents()
+    elif page == "Document Viewer":
+        page_document_viewer()
+    elif page == "Tables":
+        page_tables()
+    elif page == "Images":
+        page_images()
+    elif page == "Search & Q&A":
+        page_search()
+    elif page == "Benchmarks":
+        page_benchmarks()
+    elif page == "Admin":
+        page_admin()
+
+    st.markdown("---")
+    st.markdown('<div style="text-align: center; color: #888;">Built with ❤️ | MongoDB + OCR + Tables + RAG + Benchmarks</div>', unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
