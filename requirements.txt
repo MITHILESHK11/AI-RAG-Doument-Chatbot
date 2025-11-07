@@ -1,46 +1,25 @@
-# Core
 streamlit
-
-# PDF & OCR
 pdfplumber
-PyMuPDF          # correct package for "import fitz"
 pytesseract
-Pillow
-pdfminer.six
-
-# Parsing / HTML
-beautifulsoup4
-lxml
-bs4
-
-# Computer Vision
-opencv-python-headless
-
-# ML / Embeddings / Vector DB
-sentence-transformers
-faiss-cpu
-
-# LangChain & LLM integrations
+pillow
+PyPDF2
+fitz
+PyMuPDF
 langchain
 langchain-core
 langchain-community
-langchain-huggingface
 langchain-text-splitters
+langchain-huggingface
 langchain-groq
-langchain_groq
 langchain_huggingface
-
-# Database drivers
-pymongo[snappy,gssapi,srv,tls]   # includes gridfs and compression
-pymilvus
-
-# Utilities
+sentence-transformers
+faiss-cpu
+pdfminer.six
+beautifulsoup4
 pandas
-numpy
 requests
+opencv-python-headless
 python-dotenv
-typing_extensions
-
-# Optional / Development tools
-pytest
-tqdm
+pymongo
+pymilvus
+gridfs
