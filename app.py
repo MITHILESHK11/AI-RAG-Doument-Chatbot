@@ -3,70 +3,103 @@
 # Simplified version using local file storage (PDFs/images) and FAISS for vectors.
 # No MongoDB or Milvus to avoid crashes.
 # ==============================================================================
+# ---------------------------------------
+# CORE UTILITIES
+# ---------------------------------------
 import streamlit as st
+import gradio as gr
+from dotenv import load_dotenv
+import uuid
+from tqdm import tqdm
+import regex as re
 import os
-import re
 import json
 import time
 import traceback
 import hashlib
+import zipfile
+import base64
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
-import zipfile
 
-# Unstructured PDF partitioning
+# ---------------------------------------
+# PDF, OCR, AND IMAGE PROCESSING
+# ---------------------------------------
+import pdfplumber
+import PyPDF2
+import fitz  # PyMuPDF is imported as fitz
+from PIL import Image
+import pytesseract
+import cv2
 from unstructured.partition.pdf import partition_pdf
+import lxml
+from bs4 import BeautifulSoup
+from IPython.display import Image as IPImage, display as IPDisplay
 
-import base64
+# ---------------------------------------
+# DATA & NUMPY UTILITIES
+# ---------------------------------------
+import numpy as np
+import pandas as pd
 
-# No need for IPython.display in Streamlit UI. Remove this for Streamlit-based apps.
+# ---------------------------------------
+# LANGCHAIN ECOSYSTEM (Groq + Gemini + HuggingFace)
+# ---------------------------------------
+import langchain
+import langchain_core
+import langchain_community
+import langchain_huggingface
+import langchain_text_splitters
+import langchain_groq
+import langchain_google_genai
+import langchain_openai
 
-# ML / Embeddings / LLM Connectivity
-# HuggingFace Embeddings via LangChain
 from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# LangChain Text Splitter (latest import path)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# LangChain PromptTemplate (latest import path)
 from langchain.prompts import PromptTemplate
-
-# LangChain: Groq LLM driver (usually community, but verify latest distribution)
 from langchain_community.llms.groq import ChatGroq
-
-# LangChain Document abstraction
 from langchain_core.documents import Document
-
-# LangChain output parser
 from langchain_core.output_parsers import StrOutputParser
-
-# FAISS vector storage
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers.multi_vector import MultiVectorRetriever
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# In-memory store (class definition unchanged)
+# ---------------------------------------
+# EMBEDDINGS & VECTOR DATABASES
+# ---------------------------------------
+import sentence_transformers
+import faiss
+import chromadb
+import pymilvus
+import pymongo
+
+# ---------------------------------------
+# TOKENIZATION / UTILITIES
+# ---------------------------------------
+import tiktoken
+
+# ---------------------------------------
+# GOOGLE GEMINI API
+# ---------------------------------------
+import google.generativeai as genai
+
+# ---------------------------------------
+# OPTIONAL UTILITIES
+# ---------------------------------------
+import requests
+import fastapi
+import uvicorn
+import pickle
+
+# ---------------------------------------
+# IN-MEMORY STORE CLASS
+# ---------------------------------------
 class InMemoryStore(dict):
     """Minimal in-memory storage replacement for compatibility."""
     pass
-
-# Multi-vector retriever (latest location, community)
-from langchain_community.retrievers.multi_vector import MultiVectorRetriever
-
-# DataFrame utilities
-import pandas as pd
-
-# Google GenAI API
-import google.generativeai as genai
-
-# LangChain Google GenAI wrapper
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-# Miscellaneous utilities
-import uuid
-import logging
-import numpy as np
-import pickle
 
 # ==============================================================================
 # CONFIGURATION
