@@ -20,6 +20,7 @@ opencv-python-headless
 unstructured[all-docs]
 lxml
 beautifulsoup4
+IPython 
 
 # ---------------------------------------
 # DATA & NUMPY UTILITIES
