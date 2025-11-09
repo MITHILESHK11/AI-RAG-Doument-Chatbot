@@ -37,7 +37,7 @@ from PIL import Image
 # Vectorstore and embeddings
 # ✅ Correct imports for LangChain 0.2+
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_groq import GroqEmbeddings, ChatGroq
 from langchain_core.documents import Document
 
 # Groq for summarization
@@ -219,11 +219,9 @@ def store_tables_nosql(records: List[Dict]):
 # ---------------------------------------------------------------------------
 
 def init_vectorstore(collection_name: str = "enterprise_pdf"):
-    # using Chroma with OpenAIEmbeddings (swap as needed)
-    embeddings = OpenAIEmbeddings()
+    embeddings = GroqEmbeddings(model="nomic-embed-text", api_key=GROQ_API_KEY)
     vect = Chroma(collection_name=collection_name, embedding_function=embeddings, persist_directory=VECTOR_DIR)
     return vect
-
 
 def add_documents_to_vectorstore(vectorstore, docs: List[Document]):
     vectorstore.add_documents(docs)
@@ -231,7 +229,6 @@ def add_documents_to_vectorstore(vectorstore, docs: List[Document]):
         vectorstore.persist()
     except Exception:
         pass
-
 
 # ---------------------------------------------------------------------------
 # Search + RAG answering
