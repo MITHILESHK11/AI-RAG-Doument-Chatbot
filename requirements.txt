@@ -16,3 +16,10 @@ sentence-transformers
 pymilvus
 pymongo
 faiss-cpu
+unstructured[all-docs]
+lxml
+chromadb
+tiktoken
+langchain-google-genai
+python-dotenv
+gradio
