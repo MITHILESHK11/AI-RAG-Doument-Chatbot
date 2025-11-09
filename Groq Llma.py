@@ -339,9 +339,37 @@ def dehyphenate(text: str) -> str:
 def postprocess_extracted_text(text: str) -> str:
     if not text:
         return ""
-    text = text.replace('\r', '\n')
-    text = dehyphenate(text)
+
+    text = text.replace('\r', '\n').strip()
     text = re.sub(r'[\x0c\x0b]', '', text)
+
+    # Remove headers and footers before dehyphenation
+    lines = text.split('\n')
+    if len(lines) > 5:
+        header = lines[0].strip()
+        if len(header.split()) < 10 and (re.search(r'\d', header) or len(header) < 50):
+            lines.pop(0)
+
+        footer = lines[-1].strip()
+        if len(footer.split()) < 10 and (re.search(r'\d', footer) or len(footer) < 50):
+            lines.pop(-1)
+
+        text = '\n'.join(lines)
+
+    # Remove lines that are likely not useful text
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Keep line if it has a decent number of alphabetic characters
+        if sum(c.isalpha() for c in line) > len(line) * 0.5 or len(line.strip()) == 0:
+            cleaned_lines.append(line)
+    text = '\n'.join(cleaned_lines)
+
+    text = dehyphenate(text)
+
+    # Final cleanup of spaces around newlines
+    text = re.sub(r'\s*\n\s*', '\n', text).strip()
+
     return text
 
 def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
@@ -398,46 +426,93 @@ def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
         if not s:
             pos += len(line) + 1
             continue
-        is_allcaps = (len(s) > 2 and s.upper() == s and sum(c.isalpha() for c in s) >= 3)
-        is_short = len(s) < 60 and (s.endswith(':') or re.match(r'^\d+(\.\d+)*\s', s))
-        if is_allcaps or is_short:
+
+        # More robust heading detection
+        is_heading = False
+        # Pattern: "1.", "1.1.", "A.", "I."
+        if re.match(r'^((\d+\.)+\s|[A-Z]\.\s|[IVX]+\.\s)', s):
+            is_heading = True
+        # All caps and short
+        elif len(s.split()) < 7 and s.upper() == s and sum(c.isalpha() for c in s) > 3:
+            is_heading = True
+        # Ends with a colon and is relatively short
+        elif s.endswith(':') and len(s) < 100:
+            is_heading = True
+
+        if is_heading:
             headings.append((pos, s))
+
         pos += len(line) + 1
     return headings
 
-def chunk_document_pages(pages: List[str], doc_meta: Dict) -> Tuple[List[str], List[Dict]]:
-    page_marker_texts = [f"[Page {i+1}]\n{p}" for i, p in enumerate(pages)]
-    full_text = "\n\n".join(page_marker_texts)
-    headings = detect_headings_in_page(full_text)
-    chunks = []
-    if headings:
-        for start, heading in headings:
-            end = full_text.find('\n\n', start + len(heading) + 10)
-            chunk = full_text[start:end] if end > 0 else full_text[start:]
-            if chunk.strip():
-                chunks.append(chunk)
-    else:
-        chunks = [s.strip() for s in re.split(r'\n\s*\n', full_text) if s.strip()]
-    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
+def find_sections(pages: List[str], toc: Optional[List[Dict]] = None) -> List[Dict]:
+    sections = []
+    if toc:
+        for i, entry in enumerate(toc):
+            start_page = entry['page'] - 1
+            end_page = toc[i+1]['page'] - 1 if i + 1 < len(toc) else len(pages)
+            sections.append({
+                "title": entry['title'],
+                "start_page": start_page,
+                "end_page": end_page,
+                "text": "\n".join(pages[start_page:end_page])
+            })
+        return sections
+    # Fallback to heading-based section detection
+    for i, page_text in enumerate(pages):
+        headings = detect_headings_in_page(page_text)
+        if headings:
+            # Simple approach: assume first heading is the section title
+            sections.append({
+                "title": headings[0][1],
+                "start_page": i,
+                "end_page": i + 1,
+                "text": page_text
+            })
+        else:
+            # If no headings, treat the whole page as a section
+            sections.append({
+                "title": f"Page {i+1}",
+                "start_page": i,
+                "end_page": i + 1,
+                "text": page_text
+            })
+    return sections
+
+def chunk_document_pages(pages: List[str], doc_meta: Dict, toc: Optional[List[Dict]] = None) -> Tuple[List[str], List[Dict]]:
+    sections = find_sections(pages, toc)
     final_chunks = []
     metadatas = []
-    for i, c in enumerate(chunks):
-        if len(c) < 1200:
-            final_chunks.append(c)
-            md = {"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]}
-            m = re.search(r'\[Page (\d+)\]', c)
-            if m:
-                md["page"] = int(m.group(1))
-            metadatas.append(md)
-        else:
-            sub = splitter.split_text(c)
-            for j, s in enumerate(sub):
-                final_chunks.append(s)
-                md = {"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]}
-                m = re.search(r'\[Page (\d+)\]', s)
-                if m:
-                    md["page"] = int(m.group(1))
-                metadatas.append(md)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
+
+    for i, section in enumerate(sections):
+        # Split section text into paragraphs
+        paragraphs = re.split(r'\n\s*\n', section['text'])
+        for j, p_text in enumerate(paragraphs):
+            if len(p_text.strip()) < 50:  # Skip very short paragraphs
+                continue
+
+            # Further split large paragraphs
+            if len(p_text) > 1200:
+                sub_chunks = splitter.split_text(p_text)
+                for k, sub_chunk in enumerate(sub_chunks):
+                    final_chunks.append(sub_chunk)
+                    metadatas.append({
+                        "doc_id": doc_meta["doc_id"],
+                        "page": section["start_page"] + 1,  # Approximate page
+                        "section_title": section["title"],
+                        "paragraph": j + 1,
+                        "source": doc_meta["file_name"]
+                    })
+            else:
+                final_chunks.append(p_text)
+                metadatas.append({
+                    "doc_id": doc_meta["doc_id"],
+                    "page": section["start_page"] + 1,  # Approximate page
+                    "section_title": section["title"],
+                    "paragraph": j + 1,
+                    "source": doc_meta["file_name"]
+                })
     return final_chunks, metadatas
 
 QA_PROMPT = """You are an accurate document question-answering assistant.
@@ -612,7 +687,7 @@ def page_upload():
 
                     # Chunk and embed with Milvus
                     chunk_start = time.time()
-                    chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname})
+                    chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname}, toc)
                     milvus_coll = st.session_state.milvus_coll
                     if milvus_coll:
                         build_or_load_milvus(chunks, ch_meta, milvus_coll)
