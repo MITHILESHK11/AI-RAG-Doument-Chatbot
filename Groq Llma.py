@@ -35,6 +35,7 @@ import uuid
 import logging
 import numpy as np
 # MongoDB
+from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 from pymongo.gridfs import GridFSBucket
@@ -200,7 +201,7 @@ def build_or_load_milvus(chunks: List[str], metadatas: List[Dict], collection=No
         collection = create_milvus_collection()
         if collection is None:
             return None
-    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embed_model = get_embed_model()
     embeddings = embed_model.embed_documents(chunks)
     ids = list(range(len(chunks)))
     data = [
@@ -216,12 +217,16 @@ def build_or_load_milvus(chunks: List[str], metadatas: List[Dict], collection=No
     collection.flush()
     return collection
 
+@st.cache_resource
+def get_embed_model():
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
 def search_milvus(query: str, k: int, collection=None):
     if collection is None:
         collection = create_milvus_collection()
         if collection is None:
             return []
-    embed_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embed_model = get_embed_model()
     query_embedding = embed_model.embed_query(query)
     search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
     results = collection.search(
@@ -301,7 +306,11 @@ def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[
         try:
             reader = PdfReader(BytesIO(file_bytes))
             outline = reader.outline
-            toc = [{"title": str(getattr(item, "title", str(item))), "page": 1} for item in outline if hasattr(item, 'title')]
+            toc = []
+            for item in outline:
+                if hasattr(item, 'title') and hasattr(item, 'page'):
+                    # PyPDF2 pages are 0-indexed, so add 1 for user display
+                    toc.append({"title": str(item.title), "page": item.page + 1})
         except:
             toc = []
     except:
@@ -808,8 +817,59 @@ def edit_doc_metadata(doc):
             st.rerun()
 
 def reprocess_document(doc_id):
-    st.info("Reprocessing initiated... (Re-run extract, chunk, embed to Milvus)")
-    audit_log("REPROCESS", f"Reprocessed {doc_id}")
+    st.info(f"Reprocessing document: {doc_id}")
+    db = st.session_state.db
+    doc_coll = get_collection(db, "documents")
+    doc = doc_coll.find_one({"doc_id": doc_id})
+
+    if not doc or not doc.get('blob_id'):
+        st.error("Document data or PDF blob not found.")
+        return
+
+    # 1. Delete existing data from Milvus and Mongo collections
+    milvus_coll = st.session_state.milvus_coll
+    if milvus_coll:
+        milvus_coll.delete(f"doc_id == '{doc_id}'")
+
+    for coll_name in ["chunks", "tables", "images"]:
+        coll = get_collection(db, coll_name)
+        if coll:
+            coll.delete_many({"doc_id": doc_id})
+
+    # 2. Re-run the ingestion pipeline
+    try:
+        raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
+        if not raw:
+            st.error("Failed to load PDF from GridFS.")
+            return
+
+        pages, toc = extract_text_pdf(raw, use_ocr_if_empty=True)
+        tables = extract_tables_pdf(raw)
+        images = extract_images_pdf(raw, doc_id, db)
+        chunks, ch_meta = chunk_document_pages(pages, doc, toc)
+
+        if milvus_coll:
+            build_or_load_milvus(chunks, ch_meta, milvus_coll)
+
+        # 3. Update document metadata
+        updates = {
+            "pages": len(pages),
+            "toc": toc,
+            "tables": len(tables),
+            "images": len(images),
+            "status": "reprocessed",
+            "processed_at": time.time()
+        }
+        update_document_in_mongo(db, doc_id, updates)
+
+        audit_log("REPROCESS_SUCCESS", f"Successfully reprocessed {doc_id}")
+        st.success("✅ Document reprocessed successfully!")
+        st.rerun()
+
+    except Exception as e:
+        update_document_in_mongo(db, doc_id, {"status": "reprocess_error", "error": str(e)})
+        st.error(f"❌ Reprocessing failed: {e}")
+        audit_log("REPROCESS_ERROR", f"Failed to reprocess {doc_id}: {e}")
 
 def delete_document(doc_id):
     db = st.session_state.db
@@ -1032,24 +1092,33 @@ def page_admin():
     with tab1:
         st.subheader("System Management")
         if st.button("🔄 Rebuild Milvus Index"):
-            with st.spinner("Rebuilding..."):
+            with st.spinner("Rebuilding index in batches... This may take a while."):
                 db = st.session_state.db
                 docs = load_documents_from_mongo(db)
-                all_chunks, all_meta = [], []
-                for doc in docs:
-                    if doc.get('blob_id'):
-                        raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
-                        if raw:
-                            pages, _ = extract_text_pdf(raw)
-                            chunks, ch_meta = chunk_document_pages(pages, doc)
-                            all_chunks += chunks
-                            all_meta += ch_meta
+
                 milvus_coll = create_milvus_collection()
                 if milvus_coll:
-                    milvus_coll.drop()
-                    build_or_load_milvus(all_chunks, all_meta, milvus_coll)
-                    st.session_state.milvus_coll = milvus_coll
-                st.success("✅ Milvus index rebuilt")
+                    milvus_coll.drop()  # Clear the old collection
+                    st.session_state.milvus_coll = create_milvus_collection() # Recreate it
+
+                batch_size = 5
+                for i in range(0, len(docs), batch_size):
+                    batch_docs = docs[i:i+batch_size]
+                    all_chunks, all_meta = [], []
+                    st.write(f"Processing batch {i//batch_size + 1}...")
+                    for doc in batch_docs:
+                        if doc.get('blob_id'):
+                            raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
+                            if raw:
+                                pages, toc = extract_text_pdf(raw)
+                                chunks, ch_meta = chunk_document_pages(pages, doc, toc)
+                                all_chunks.extend(chunks)
+                                all_meta.extend(ch_meta)
+
+                    if all_chunks:
+                        build_or_load_milvus(all_chunks, all_meta, st.session_state.milvus_coll)
+
+                st.success("✅ Milvus index rebuilt successfully!")
 
         col1, col2, col3 = st.columns(3)
         with col1:
