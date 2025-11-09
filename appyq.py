@@ -15,19 +15,21 @@ Key Features:
 - Storage: Chroma (vector DB) for text summaries; JSON file (NoSQL sim) for raw tables.
 - Retrieval: MultiVectorRetriever for text/images; separate lookup for tables.
 - Search Interface: Simple Gradio web UI for querying.
+- Multi-Language Support: OCR with configurable languages (e.g., eng+fra); Models handle multi-lang natively.
 - Strictly uses Groq and Gemini APIs (no OpenAI).
 
 Setup Instructions:
 1. Install dependencies: pip install -Uq "unstructured[all-docs]" pillow lxml chromadb tiktoken langchain langchain-community langchain-groq langchain-google-genai python_dotenv gradio
 2. Install system deps: For Linux: apt-get install poppler-utils tesseract-ocr libmagic-dev; For Mac: brew install poppler tesseract libmagic
-3. Set env vars: OPENAI_API_KEY -> no, use GROQ_API_KEY and GOOGLE_API_KEY.
+   - For multi-lang OCR: Install tesseract lang packs, e.g., apt-get install tesseract-ocr-fra
+3. Set env vars: GROQ_API_KEY and GOOGLE_API_KEY.
 4. Run: python this_script.py
 
 Documentation:
-- Input: PDF file path.
+- Input: PDF file path + optional languages (e.g., ['eng', 'fra']).
 - Output: Chroma DB (./chroma_db), tables.json (NoSQL store).
 - Performance: See benchmarks in __main__.
-- Stretch: Basic multi-lang support via Gemini; low-quality scans via OCR; chart extraction via image desc.
+- Stretch: Multi-lang via Gemini/tesseract; low-quality scans via OCR; chart extraction via image desc.
 
 References:
 - Inspired by: https://github.com/langchain-ai/langchain/blob/master/cookbook/Semi_structured_and_multi_modal_RAG.ipynb
@@ -80,29 +82,32 @@ def display_base64_image(base64_code):
     image_data = base64.b64decode(base64_code)
     display(Image(data=image_data))
 
-def summarize_text_tables_groq(elements):
-    """Summarize text/tables using Groq Llama-3.1."""
-    prompt_text = """
+def summarize_text_tables_groq(elements, languages=['en']):
+    """Summarize text/tables using Groq Llama-3.1, with multi-lang awareness."""
+    lang_hint = f" (Document language(s): {', '.join(languages)})" if len(languages) > 1 else ""
+    prompt_text = f"""
     You are an assistant tasked with summarizing tables and text.
+    Provide the summary in English, but preserve key terms in original language if necessary{lang_hint}.
     Give a concise summary of the table or text.
 
     Respond only with the summary, no additional comment.
     Do not start your message by saying "Here is a summary" or anything like that.
     Just give the summary as it is.
 
-    Table or text chunk: {element}
+    Table or text chunk: {{element}}
     """
     prompt = ChatPromptTemplate.from_template(prompt_text)
     model = ChatGroq(temperature=0.5, model="llama-3.1-8b-instant")
     summarize_chain = {"element": lambda x: x} | prompt | model | StrOutputParser()
     return summarize_chain.batch(elements, {"max_concurrency": 3})
 
-def summarize_images_gemini(images):
-    """Summarize images using Gemini (multimodal)."""
-    prompt_template = """Describe the image in detail. For context,
-                          the image is part of an enterprise document like reports or manuals.
+def summarize_images_gemini(images, languages=['en']):
+    """Summarize images using Gemini (multimodal), with multi-lang support."""
+    lang_hint = f"Document language(s): {', '.join(languages)}. Translate descriptions to English if needed, but note original lang text."
+    prompt_template = f"""Describe the image in detail. For context,
+                          the image is part of an enterprise document like reports or manuals.{lang_hint}
                           Be specific about charts, graphs, tables, or visuals for searchability.
-                          Support multiple languages if text is present."""
+                          If text is in the image, transcribe and translate key parts to English."""
     messages = [
         (
             "user",
@@ -110,7 +115,7 @@ def summarize_images_gemini(images):
                 {"type": "text", "text": prompt_template},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "data:image/jpeg;base64,{image}"},
+                    "image_url": {"url": "data:image/jpeg;base64,{{image}}"},
                 },
             ],
         ),
@@ -135,8 +140,8 @@ def parse_docs(docs):
             text.append(doc)
     return {"images": b64, "texts": text}
 
-def build_prompt(kwargs):
-    """Build multimodal prompt for Gemini."""
+def build_prompt(kwargs, languages=['en']):
+    """Build multimodal prompt for Gemini, multi-lang aware."""
     docs_by_type = kwargs["context"]
     user_question = kwargs["question"]
     context_text = ""
@@ -144,9 +149,10 @@ def build_prompt(kwargs):
         for text_element in docs_by_type["texts"]:
             context_text += getattr(text_element, 'text', str(text_element))  # .text for elements
 
+    lang_hint = f"Document language(s): {', '.join(languages)}. Answer in English."
     prompt_template = f"""
     Answer the question based only on the following context, which can include text, tables, and images/charts.
-    Use descriptions for visuals. Support precise table queries if applicable.
+    Use descriptions for visuals. Support precise table queries if applicable.{lang_hint}
     Context: {context_text}
     Question: {user_question}
     """
@@ -158,9 +164,10 @@ def build_prompt(kwargs):
             )
     return ChatPromptTemplate.from_messages([HumanMessage(content=prompt_content)])
 
-def process_pdf(file_path, clear_db=False):
+def process_pdf(file_path, ocr_languages=['eng'], clear_db=False):
     """
     Main pipeline: Process PDF -> Extract -> Summarize -> Store.
+    Supports multi-lang OCR via ocr_languages (e.g., ['eng', 'fra']).
     Returns retriever and table_store.
     """
     if clear_db:
@@ -173,11 +180,12 @@ def process_pdf(file_path, clear_db=False):
         with open(TABLES_JSON, 'w') as f:
             json.dump({}, f)
 
-    # Partition PDF (handles OCR, tables, images; chunk by title for sections)
+    # Partition PDF (handles OCR with multi-lang, tables, images; chunk by title for sections)
     chunks = partition_pdf(
         filename=file_path,
         infer_table_structure=True,
         strategy="hi_res",  # For OCR/layout
+        languages=ocr_languages,  # Multi-lang OCR (tesseract langs)
         extract_image_block_types=["Image"],
         extract_image_block_to_payload=True,
         chunking_strategy="by_title",  # Respects chapters/sections
@@ -193,13 +201,13 @@ def process_pdf(file_path, clear_db=False):
 
     # Summarize
     start_time = time.time()
-    text_summaries = summarize_text_tables_groq([t.text for t in texts])
+    text_summaries = summarize_text_tables_groq([t.text for t in texts], ocr_languages)
     tables_html = [table.metadata.text_as_html for table in tables]
-    table_summaries = summarize_text_tables_groq(tables_html)
-    image_summaries = summarize_images_gemini(images)
+    table_summaries = summarize_text_tables_groq(tables_html, ocr_languages)
+    image_summaries = summarize_images_gemini(images, ocr_languages)
     process_time = time.time() - start_time
 
-    # Vectorstore setup (text summaries)
+    # Vectorstore setup (text summaries; Google embeddings multi-lang)
     embedding_func = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vectorstore = Chroma(
         collection_name="enterprise_rag",
@@ -230,7 +238,8 @@ def process_pdf(file_path, clear_db=False):
             "summary": table_summaries[i],
             "html": tables_html[i],
             "markdown": table.text,  # For precise queries
-            "page": getattr(table.metadata, 'page_number', 'N/A')
+            "page": getattr(table.metadata, 'page_number', 'N/A'),
+            "languages": ocr_languages
         }
         table_store[table_ids[i]] = table_data
     with open(TABLES_JSON, 'w') as f:
@@ -245,25 +254,26 @@ def process_pdf(file_path, clear_db=False):
     # Persist Chroma
     vectorstore.persist()
 
-    print(f"Processed in {process_time:.2f}s. Extracted: {len(texts)} texts, {len(tables)} tables, {len(images)} images.")
+    print(f"Processed in {process_time:.2f}s with languages {ocr_languages}. Extracted: {len(texts)} texts, {len(tables)} tables, {len(images)} images.")
 
-    # RAG Chain (Gemini multimodal)
-    chain = (
-        {
-            "context": retriever | RunnableLambda(parse_docs),
-            "question": RunnablePassthrough(),
-        }
-        | RunnableLambda(build_prompt)
-        | ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-        | StrOutputParser()
-    )
+    # RAG Chain (Gemini multimodal, multi-lang)
+    def chain_invoke(query):
+        return (
+            {
+                "context": retriever | RunnableLambda(parse_docs),
+                "question": RunnablePassthrough(),
+            }
+            | RunnableLambda(lambda kwargs: build_prompt(kwargs, ocr_languages))
+            | ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+            | StrOutputParser()
+        ).invoke(query)
 
-    return chain, table_store
+    return chain_invoke, table_store
 
-def query_knowledge_base(query, chain, table_store):
+def query_knowledge_base(query, chain, table_store, languages=['eng']):
     """Query the RAG + check for table-specific."""
     start_time = time.time()
-    response = chain.invoke(query)
+    response = chain(query)
     query_time = time.time() - start_time
 
     # For precise table queries, check if response mentions tables
@@ -271,21 +281,21 @@ def query_knowledge_base(query, chain, table_store):
         # Simple lookup: return relevant table if summary matches (in prod, use vector search on tables)
         relevant_tables = [t for t in table_store.values() if any(kw in t["summary"].lower() for kw in query.lower().split())]
         if relevant_tables:
-            response += f"\n\nRelevant Table Data:\n{json.dumps(relevant_tables[0], indent=2)}"
+            response += f"\n\nRelevant Table Data (langs: {t.get('languages', languages)}):\n{json.dumps(relevant_tables[0], indent=2)}"
 
     print(f"Query time: {query_time:.2f}s")
     return response
 
 # Performance Benchmarks
-def run_benchmarks(file_path):
+def run_benchmarks(file_path, ocr_languages=['eng']):
     """Run timing benchmarks."""
     print("Benchmarking...")
-    chain, _ = process_pdf(file_path)
+    chain, _ = process_pdf(file_path, ocr_languages)
     queries = ["What is the main topic?", "Summarize the tables.", "Describe any charts."]
     times = []
     for q in queries:
         start = time.time()
-        query_knowledge_base(q, chain, {})
+        query_knowledge_base(q, chain, {}, ocr_languages)
         times.append(time.time() - start)
     avg_query_time = sum(times) / len(times)
     print(f"Avg Query Time: {avg_query_time:.2f}s | {len(queries)} queries")
@@ -293,19 +303,36 @@ def run_benchmarks(file_path):
 if __name__ == "__main__":
     # Example usage
     file_path = OUTPUT_PATH + "enterprise_report.pdf"  # Replace with your PDF
-    run_benchmarks(file_path)  # Optional benchmark
+    run_benchmarks(file_path, ['eng', 'fra'])  # Optional benchmark with multi-lang
 
     # Launch Gradio Search Interface
+    def gradio_process_and_query(file, languages_input):
+        if file is None:
+            return "Please upload a PDF."
+        file_path = file.name
+        ocr_langs = languages_input.split(',') if languages_input else ['eng']
+        ocr_langs = [lang.strip() for lang in ocr_langs]
+        gradio_process_and_query.chain, gradio_process_and_query.table_store = process_pdf(file_path, ocr_langs)
+        return f"PDF processed with languages: {ocr_langs}. Ready to query!"
+
     def gradio_query(query):
         if not hasattr(gradio_query, 'chain'):
-            gradio_query.chain, gradio_query.table_store = process_pdf(file_path)
-        return query_knowledge_base(query, gradio_query.chain, gradio_query.table_store)
+            return "Please process a PDF first."
+        return query_knowledge_base(query, gradio_query.chain, gradio_query.table_store, ['eng'])  # Default, but use from process
 
-    iface = gr.Interface(
-        fn=gradio_query,
-        inputs=gr.Textbox(label="Enter your search query:"),
-        outputs=gr.Textbox(label="Response:"),
-        title="Enterprise PDF Knowledge Base Search",
-        description="Query your processed PDFs semantically, including tables and images."
-    )
+    with gr.Blocks() as iface:
+        gr.Markdown("# Enterprise PDF Knowledge Base")
+        with gr.Row():
+            file_input = gr.File(label="Upload PDF", file_types=[".pdf"])
+            lang_input = gr.Textbox(label="OCR Languages (comma-separated, e.g., eng,fra)", placeholder="eng")
+        process_btn = gr.Button("Process PDF")
+        process_output = gr.Textbox(label="Processing Status")
+
+        query_input = gr.Textbox(label="Enter your search query:")
+        query_btn = gr.Button("Search")
+        response_output = gr.Textbox(label="Response:")
+
+        process_btn.click(gradio_process_and_query, inputs=[file_input, lang_input], outputs=process_output)
+        query_btn.click(gradio_query, inputs=query_input, outputs=response_output)
+
     iface.launch(share=True)
