@@ -35,10 +35,10 @@ from unstructured.partition.pdf import partition_pdf
 from PIL import Image
 
 # Vectorstore and embeddings
+# ✅ Correct imports for LangChain 0.2+
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_core.documents import Document
-
 
 # Groq for summarization
 try:
