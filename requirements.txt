@@ -23,3 +23,5 @@ tiktoken
 langchain-google-genai
 python-dotenv
 gradio
+google-generativeai
+uuid
