@@ -1,7 +1,7 @@
 # ==============================================================================
 # ENTERPRISE PDF → KNOWLEDGE: Simplified Streamlit Application
 # Simplified version using local file storage (PDFs/images) and FAISS for vectors.
-# No MongoDB or Milvus to avoid crashes.
+# No MongoDB or Milvus to avoid crashes. Using pytesseract for OCR (CPU-compatible).
 # ==============================================================================
 
 import streamlit as st
@@ -22,6 +22,9 @@ import pdfplumber
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
 from PIL import Image
+import pytesseract
+import cv2
+import numpy as np
 
 # ML / LLM / embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -34,10 +37,6 @@ import pandas as pd
 import uuid
 import logging
 import pickle
-
-# DeepSeek OCR
-from vllm import LLM, SamplingParams
-from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
 
 # ==============================================================================
 # CONFIGURATION
@@ -55,18 +54,6 @@ TABLES_FILE = f"{DATA_DIR}/tables.json"
 IMAGES_FILE = f"{DATA_DIR}/images.json"
 
 DIMENSION = 384  # For all-MiniLM-L6-v2
-
-# DeepSeek OCR Sampling Params
-SAMPLING_PARAMS = SamplingParams(
-    temperature=0.0,
-    max_tokens=8192,
-    extra_args=dict(
-        ngram_size=30,
-        window_size=90,
-        whitelist_token_ids={128821, 128822},  # <td>, </td>
-    ),
-    skip_special_tokens=False,
-)
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO)
@@ -106,21 +93,28 @@ st.markdown(
 def get_embed_model():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-@st.cache_resource
-def get_ocr_model():
-    llm = LLM(
-        model="deepseek-ai/DeepSeek-OCR",
-        enable_prefix_caching=False,
-        mm_processor_cache_gb=0,
-        logits_processors=[NGramPerReqLogitsProcessor]
-    )
-    return llm
+def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11)
+    coords = np.column_stack(np.where(th > 0))
+    if len(coords) > 0:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        if abs(angle) > 0.5:
+            (h, w) = th.shape
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            th = cv2.warpAffine(th, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(th)
 
-def ocr_image(llm, image: Image.Image) -> str:
-    prompt = "<image>\nFree OCR."
-    model_input = [{"prompt": prompt, "multi_modal_data": {"image": image}}]
-    outputs = llm.generate(model_input, SAMPLING_PARAMS)
-    return outputs[0].outputs[0].text.strip()
+def ocr_image(image: Image.Image) -> str:
+    preprocessed = preprocess_image_for_ocr(image)
+    return pytesseract.image_to_string(preprocessed, lang='eng').strip()
 
 def load_json_file(file_path: str) -> List[Dict]:
     if os.path.exists(file_path):
@@ -221,8 +215,6 @@ if 'search_results' not in st.session_state:
     st.session_state.search_results = []
 if 'selected_doc' not in st.session_state:
     st.session_state.selected_doc = None
-if 'ocr_llm' not in st.session_state:
-    st.session_state.ocr_llm = get_ocr_model()
 
 # ==============================================================================
 # HELPER FUNCTIONS (Kept from original, adapted)
@@ -263,7 +255,6 @@ def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[
     if use_ocr_if_empty and any(not p.strip() for p in pages):
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            llm = st.session_state.ocr_llm
             for i in range(len(doc)):
                 if pages[i].strip():
                     continue
@@ -272,7 +263,7 @@ def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                ocr_text = ocr_image(llm, img)
+                ocr_text = ocr_image(img)
                 pages[i] = safe_text(ocr_text)
         except:
             pass
@@ -317,7 +308,6 @@ def extract_images_pdf(file_bytes: bytes, doc_id: str) -> List[Dict]:
     imgs = []
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        llm = st.session_state.ocr_llm
         for page_i in range(len(doc)):
             page = doc[page_i]
             image_list = page.get_images(full=True)
@@ -330,7 +320,7 @@ def extract_images_pdf(file_bytes: bytes, doc_id: str) -> List[Dict]:
                 img_path = save_image_local(img_name, image_bytes, ext)
                 if img_path:
                     pil = Image.open(BytesIO(image_bytes)).convert("RGB")
-                    caption = ocr_image(llm, pil)
+                    caption = ocr_image(pil)
                     if not caption:
                         caption = "Image (no OCR text) — visual content"
                     imgs.append({"img_path": img_path, "page": page_i + 1, "caption": caption, "id": f"img_{doc_id}_{img_index}"})
@@ -698,7 +688,7 @@ def page_search():
 
 def main():
     st.sidebar.title("📚 Enterprise PDF → Knowledge")
-    st.sidebar.markdown("Simplified: Local files + FAISS")
+    st.sidebar.markdown("Simplified: Local files + FAISS + pytesseract OCR")
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 Navigation")
     page = st.sidebar.radio(
@@ -727,7 +717,7 @@ def main():
     elif page == "Search & Q&A":
         page_search()
     st.markdown("---")
-    st.markdown('<div style="text-align: center; color: #888;">Simplified with ❤️ | Local Storage + FAISS + OCR + Tables + RAG</div>', unsafe_allow_html=True)
+    st.markdown('<div style="text-align: center; color: #888;">Simplified with ❤️ | Local Storage + FAISS + pytesseract OCR + Tables + RAG</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
