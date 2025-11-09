@@ -3,7 +3,6 @@
 # Simplified version using local file storage (PDFs/images) and FAISS for vectors.
 # No MongoDB or Milvus to avoid crashes.
 # ==============================================================================
-
 import streamlit as st
 import os
 import re
@@ -17,26 +16,53 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import zipfile
 
+# Unstructured PDF partitioning
 from unstructured.partition.pdf import partition_pdf
-import base64
-from IPython.display import Image, display
 
-# ML / LLM / embeddings
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
-from langchain_groq import ChatGroq
+import base64
+
+# No need for IPython.display in Streamlit UI. Remove this for Streamlit-based apps.
+
+# ML / Embeddings / LLM Connectivity
+# HuggingFace Embeddings via LangChain
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# LangChain Text Splitter (latest import path)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# LangChain PromptTemplate (latest import path)
+from langchain.prompts import PromptTemplate
+
+# LangChain: Groq LLM driver (usually community, but verify latest distribution)
+from langchain_community.llms.groq import ChatGroq
+
+# LangChain Document abstraction
 from langchain_core.documents import Document
+
+# LangChain output parser
 from langchain_core.output_parsers import StrOutputParser
+
+# FAISS vector storage
 from langchain_community.vectorstores import FAISS
+
+# In-memory store (class definition unchanged)
 class InMemoryStore(dict):
     """Minimal in-memory storage replacement for compatibility."""
     pass
 
+# Multi-vector retriever (latest location, community)
 from langchain_community.retrievers.multi_vector import MultiVectorRetriever
+
+# DataFrame utilities
 import pandas as pd
+
+# Google GenAI API
 import google.generativeai as genai
+
+# LangChain Google GenAI wrapper
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Miscellaneous utilities
 import uuid
 import logging
 import numpy as np
