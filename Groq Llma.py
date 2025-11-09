@@ -234,7 +234,11 @@ def extract_text_pdf(file_bytes: bytes, use_ocr_if_empty: bool = True) -> Tuple[
         try:
             reader = PdfReader(BytesIO(file_bytes))
             outline = reader.outline
-            toc = [{"title": str(getattr(item, "title", str(item))), "page": 1} for item in outline if hasattr(item, 'title')]
+            toc = []
+            for item in outline:
+                if hasattr(item, 'title') and hasattr(item, 'page'):
+                    # PyPDF2 pages are 0-indexed, so add 1 for user display
+                    toc.append({"title": str(item.title), "page": item.page + 1})
         except:
             toc = []
     except:
