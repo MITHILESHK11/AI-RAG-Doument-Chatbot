@@ -29,7 +29,7 @@ from langchain_groq import ChatGroq
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores import FAISS
-from langchain_community.storage import InMemoryStore
+from langchain.storage.memory import InMemoryStore
 from langchain_community.retrievers.multi_vector import MultiVectorRetriever
 import pandas as pd
 import google.generativeai as genai
