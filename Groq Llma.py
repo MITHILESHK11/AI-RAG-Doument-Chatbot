@@ -1,7 +1,7 @@
 # ==============================================================================
-# ENTERPRISE PDF → KNOWLEDGE: Enhanced Streamlit Application
-# Full-featured application using only MongoDB (for all data incl. blobs) and Milvus Vector DB.
-# No local file storage; PDFs/images stored as binary in MongoDB.
+# ENTERPRISE PDF → KNOWLEDGE: Simplified Streamlit Application
+# Simplified version using local file storage (PDFs/images) and FAISS for vectors.
+# No MongoDB or Milvus to avoid crashes.
 # ==============================================================================
 
 import streamlit as st
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import zipfile
+
 # Extraction libs
 import pdfplumber
 from PyPDF2 import PdfReader
@@ -25,43 +26,35 @@ import pytesseract
 import cv2
 import numpy as np
 from bs4 import BeautifulSoup
+
 # ML / LLM / embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
 import pandas as pd
 import uuid
 import logging
 import numpy as np
-# MongoDB
-from bson import ObjectId
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
-from pymongo.gridfs import GridFSBucket
-# Milvus
-from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
+import pickle
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-# MongoDB Configuration
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = "pdf_knowledge_db"
-COLLECTIONS = {
-    "documents": "documents",
-    "chunks": "chunks",
-    "tables": "tables",
-    "images": "images"
-}
-BUCKETS = {
-    "pdfs": "pdfs_bucket",
-    "images": "images_bucket"
-}
 
-# Milvus Configuration
-MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
-COLLECTION_NAME = "chunks_collection"
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(f"{DATA_DIR}/pdfs", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/images", exist_ok=True)
+os.makedirs(f"{DATA_DIR}/faiss_index", exist_ok=True)
+
+DOCS_FILE = f"{DATA_DIR}/documents.json"
+CHUNKS_FILE = f"{DATA_DIR}/chunks.json"  # Not strictly needed, as FAISS holds them
+TABLES_FILE = f"{DATA_DIR}/tables.json"
+IMAGES_FILE = f"{DATA_DIR}/images.json"
+
 DIMENSION = 384  # For all-MiniLM-L6-v2
 
 # Logging configuration
@@ -92,178 +85,117 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# MONGO HELPER FUNCTIONS (Enhanced with GridFS for Blobs)
+# LOCAL STORAGE HELPER FUNCTIONS
 # ==============================================================================
-@st.cache_resource
-def get_mongo_client():
-    try:
-        client = MongoClient(MONGO_URI)
-        client.admin.command('ping')
-        db = client[DB_NAME]
-        return db
-    except ConnectionFailure:
-        st.error("❌ MongoDB connection failed.")
-        return None
-
-def get_collection(db, coll_name):
-    if db is None:
-        return None
-    return db[COLLECTIONS.get(coll_name, coll_name)]
-
-def get_bucket(db, bucket_name):
-    if db is None:
-        return None
-    return GridFSBucket(db, bucket_name)
-
-def load_documents_from_mongo(db):
-    coll = get_collection(db, "documents")
-    if coll:
-        return list(coll.find({}, {"_id": 0}))
-    return []
-
-def save_document_to_mongo(db, doc_data):
-    coll = get_collection(db, "documents")
-    if coll:
-        coll.insert_one(doc_data)
-
-def update_document_in_mongo(db, doc_id, updates):
-    coll = get_collection(db, "documents")
-    if coll:
-        coll.update_one({"doc_id": doc_id}, {"$set": updates})
-
-def delete_document_from_mongo(db, doc_id):
-    coll = get_collection(db, "documents")
-    if coll:
-        coll.delete_one({"doc_id": doc_id})
-        # Cascade delete chunks, tables, images
-        for c in ["chunks", "tables", "images"]:
-            get_collection(db, c).delete_many({"doc_id": doc_id})
-        # Delete blobs
-        pdf_bucket = get_bucket(db, BUCKETS["pdfs"])
-        img_bucket = get_bucket(db, BUCKETS["images"])
-        if pdf_bucket:
-            pdf_bucket.delete(doc_id)  # Assuming filename is doc_id
-        if img_bucket:
-            img_coll = get_collection(db, "images")
-            img_ids = [img.get('blob_id') for img in img_coll.find({"doc_id": doc_id}, {"_id": 0, "blob_id": 1})]
-            for img_id in img_ids:
-                img_bucket.delete(img_id)
-
-def save_blob(db, bucket, file_name, file_bytes, metadata=None):
-    bucket_instance = get_bucket(db, bucket)
-    if bucket_instance:
-        file_id = bucket_instance.upload_from_stream(file_name, BytesIO(file_bytes), metadata=metadata)
-        return str(file_id)
-    return None
-
-def load_blob(db, bucket, file_id):
-    bucket_instance = get_bucket(db, bucket)
-    if bucket_instance:
-        file_obj = bucket_instance.open_download_stream(ObjectId(file_id))
-        return file_obj.read()
-    return None
-
-# ==============================================================================
-# MILVUS HELPER FUNCTIONS
-# ==============================================================================
-@st.cache_resource
-def get_milvus_connection():
-    try:
-        connections.connect(alias="default", uri=MILVUS_URI)
-        if not utility.has_collection(COLLECTION_NAME):
-            create_milvus_collection()
-        return True
-    except:
-        st.error("❌ Milvus connection failed.")
-        return False
-
-def create_milvus_collection():
-    if not get_milvus_connection():
-        return None
-    fields = [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-        FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=100),
-        FieldSchema(name="page", dtype=DataType.INT32, default_value=0),
-        FieldSchema(name="section_title", dtype=DataType.VARCHAR, max_length=200),
-        FieldSchema(name="paragraph", dtype=DataType.INT32, default_value=0),
-        FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=200),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=DIMENSION)
-    ]
-    schema = CollectionSchema(fields=fields, description="PDF chunks embeddings")
-    collection = Collection(COLLECTION_NAME, schema)
-    index_params = {"index_type": "IVF_FLAT", "metric_type": "L2", "params": {"nlist": 128}}
-    collection.create_index(field_name="embedding", index_params=index_params)
-    collection.load()
-    return collection
-
-def build_or_load_milvus(chunks: List[str], metadatas: List[Dict], collection=None):
-    if collection is None:
-        collection = create_milvus_collection()
-        if collection is None:
-            return None
-    embed_model = get_embed_model()
-    embeddings = embed_model.embed_documents(chunks)
-    ids = list(range(len(chunks)))
-    data = [
-        ids,
-        [m["doc_id"] for m in metadatas],
-        [m.get("page", 0) for m in metadatas],
-        [m.get("section_title", "") for m in metadatas],
-        [m.get("paragraph", 0) for m in metadatas],
-        [m["source"] for m in metadatas],
-        embeddings
-    ]
-    collection.insert(data)
-    collection.flush()
-    return collection
 
 @st.cache_resource
 def get_embed_model():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-def search_milvus(query: str, k: int, collection=None):
-    if collection is None:
-        collection = create_milvus_collection()
-        if collection is None:
-            return []
-    embed_model = get_embed_model()
-    query_embedding = embed_model.embed_query(query)
-    search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
-    results = collection.search(
-        data=[query_embedding],
-        anns_field="embedding",
-        param=search_params,
-        limit=k,
-        output_fields=["doc_id", "page", "section_title", "paragraph", "source"]
-    )
-    # Fetch full texts from Mongo for results
-    db = st.session_state.db
-    chunks_coll = get_collection(db, "chunks")
-    docs = []
-    for hit in results[0]:
-        md = hit.entity
-        chunk_doc = chunks_coll.find_one({"doc_id": md["doc_id"], "page": md["page"], "paragraph": md["paragraph"]})
-        if chunk_doc:
-            docs.append({"page_content": chunk_doc["text"], "metadata": md})
-    return docs
+def load_json_file(file_path: str) -> List[Dict]:
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_json_file(file_path: str, data: List[Dict]):
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_documents() -> List[Dict]:
+    return load_json_file(DOCS_FILE)
+
+def save_document(doc_data: Dict):
+    docs = load_documents()
+    docs.append(doc_data)
+    save_json_file(DOCS_FILE, docs)
+
+def update_document(doc_id: str, updates: Dict):
+    docs = load_documents()
+    for i, doc in enumerate(docs):
+        if doc["doc_id"] == doc_id:
+            docs[i].update(updates)
+            save_json_file(DOCS_FILE, docs)
+            break
+
+def delete_document(doc_id: str):
+    docs = load_documents()
+    docs = [d for d in docs if d["doc_id"] != doc_id]
+    save_json_file(DOCS_FILE, docs)
+    # Cascade: remove chunks from FAISS (simplified: rebuild on next load)
+    # For tables/images: filter them too
+    tables = load_json_file(TABLES_FILE)
+    tables = [t for t in tables if t.get("doc_id") != doc_id]
+    save_json_file(TABLES_FILE, tables)
+    images = load_json_file(IMAGES_FILE)
+    images = [img for img in images if img.get("doc_id") != doc_id]
+    save_json_file(IMAGES_FILE, images)
+
+def save_pdf_local(doc_id: str, file_bytes: bytes, file_name: str):
+    path = f"{DATA_DIR}/pdfs/{file_name}"
+    with open(path, 'wb') as f:
+        f.write(file_bytes)
+    return path
+
+def load_pdf_local(file_path: str) -> bytes:
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            return f.read()
+    return None
+
+def save_image_local(img_id: str, image_bytes: bytes, ext: str = "png"):
+    path = f"{DATA_DIR}/images/{img_id}.{ext}"
+    with open(path, 'wb') as f:
+        f.write(image_bytes)
+    return path
+
+def load_image_local(img_path: str) -> bytes:
+    if os.path.exists(img_path):
+        with open(img_path, 'rb') as f:
+            return f.read()
+    return None
 
 # ==============================================================================
-# SESSION STATE & AUTHENTICATION
+# FAISS HELPER FUNCTIONS
 # ==============================================================================
-if 'user_role' not in st.session_state:
-    st.session_state.user_role = 'viewer'
+
+@st.cache_resource
+def get_faiss_vectorstore():
+    if os.path.exists(f"{DATA_DIR}/faiss_index/index.faiss") and os.path.exists(f"{DATA_DIR}/faiss_index/index.pkl"):
+        try:
+            return FAISS.load_local(f"{DATA_DIR}/faiss_index", get_embed_model(), allow_dangerous_deserialization=True)
+        except:
+            pass
+    return None
+
+def build_or_load_faiss(documents: List[Document]):
+    vectorstore = get_faiss_vectorstore()
+    if vectorstore is None:
+        vectorstore = FAISS.from_documents(documents, get_embed_model())
+    else:
+        vectorstore.add_documents(documents)
+    vectorstore.save_local(f"{DATA_DIR}/faiss_index")
+    return vectorstore
+
+def search_faiss(query: str, k: int):
+    vectorstore = get_faiss_vectorstore()
+    if vectorstore is None:
+        return []
+    return vectorstore.similarity_search(query, k=k)
+
+# ==============================================================================
+# SESSION STATE
+# ==============================================================================
+
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
 if 'selected_doc' not in st.session_state:
     st.session_state.selected_doc = None
-if 'db' not in st.session_state:
-    st.session_state.db = get_mongo_client()
-if 'milvus_coll' not in st.session_state:
-    st.session_state.milvus_coll = create_milvus_collection()
 
 # ==============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (Kept from original, adapted)
 # ==============================================================================
+
 def make_doc_id() -> str:
     return str(uuid.uuid4())[:12]
 
@@ -271,10 +203,6 @@ def safe_text(s: Optional[str]) -> str:
     if not s:
         return ""
     return re.sub(r'[\ud800-\udfff]', '', s)
-
-def audit_log(action: str, details: str = ""):
-    timestamp = datetime.now().isoformat()
-    logger.info(f"ACTION: {action} | ROLE: {st.session_state.user_role} | DETAILS: {details}")
 
 def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -348,37 +276,9 @@ def dehyphenate(text: str) -> str:
 def postprocess_extracted_text(text: str) -> str:
     if not text:
         return ""
-
-    text = text.replace('\r', '\n').strip()
-    text = re.sub(r'[\x0c\x0b]', '', text)
-
-    # Remove headers and footers before dehyphenation
-    lines = text.split('\n')
-    if len(lines) > 5:
-        header = lines[0].strip()
-        if len(header.split()) < 10 and (re.search(r'\d', header) or len(header) < 50):
-            lines.pop(0)
-
-        footer = lines[-1].strip()
-        if len(footer.split()) < 10 and (re.search(r'\d', footer) or len(footer) < 50):
-            lines.pop(-1)
-
-        text = '\n'.join(lines)
-
-    # Remove lines that are likely not useful text
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        # Keep line if it has a decent number of alphabetic characters
-        if sum(c.isalpha() for c in line) > len(line) * 0.5 or len(line.strip()) == 0:
-            cleaned_lines.append(line)
-    text = '\n'.join(cleaned_lines)
-
+    text = text.replace('\r', '\n')
     text = dehyphenate(text)
-
-    # Final cleanup of spaces around newlines
-    text = re.sub(r'\s*\n\s*', '\n', text).strip()
-
+    text = re.sub(r'[\x0c\x0b]', '', text)
     return text
 
 def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
@@ -400,9 +300,8 @@ def extract_tables_pdf(file_bytes: bytes) -> List[Dict]:
         pass
     return tables_all
 
-def extract_images_pdf(file_bytes: bytes, doc_id: str, db) -> List[Dict]:
+def extract_images_pdf(file_bytes: bytes, doc_id: str) -> List[Dict]:
     imgs = []
-    img_bucket = get_bucket(db, BUCKETS["images"])
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         for page_i in range(len(doc)):
@@ -413,15 +312,14 @@ def extract_images_pdf(file_bytes: bytes, doc_id: str, db) -> List[Dict]:
                 base_image = doc.extract_image(xref)
                 image_bytes = base_image["image"]
                 ext = base_image.get("ext", "png")
-                img_name = f"{doc_id}_p{page_i+1}_img{img_index}.{ext}"
-                metadata = {"doc_id": doc_id, "page": page_i + 1}
-                blob_id = save_blob(db, BUCKETS["images"], img_name, image_bytes, metadata)
-                if blob_id:
+                img_name = f"{doc_id}_p{page_i+1}_img{img_index}"
+                img_path = save_image_local(img_name, image_bytes, ext)
+                if img_path:
                     pil = Image.open(BytesIO(image_bytes)).convert("RGB")
                     caption = pytesseract.image_to_string(preprocess_image_for_ocr(pil), lang='eng').strip()
                     if not caption:
                         caption = "Image (no OCR text) — visual content"
-                    imgs.append({"blob_id": blob_id, "page": page_i + 1, "caption": caption, "id": f"img_{doc_id}_{img_index}"})
+                    imgs.append({"img_path": img_path, "page": page_i + 1, "caption": caption, "id": f"img_{doc_id}_{img_index}"})
     except:
         pass
     return imgs
@@ -435,111 +333,68 @@ def detect_headings_in_page(page_text: str) -> List[Tuple[int, str]]:
         if not s:
             pos += len(line) + 1
             continue
-
-        # More robust heading detection
-        is_heading = False
-        # Pattern: "1.", "1.1.", "A.", "I."
-        if re.match(r'^((\d+\.)+\s|[A-Z]\.\s|[IVX]+\.\s)', s):
-            is_heading = True
-        # All caps and short
-        elif len(s.split()) < 7 and s.upper() == s and sum(c.isalpha() for c in s) > 3:
-            is_heading = True
-        # Ends with a colon and is relatively short
-        elif s.endswith(':') and len(s) < 100:
-            is_heading = True
-
-        if is_heading:
+        is_allcaps = (len(s) > 2 and s.upper() == s and sum(c.isalpha() for c in s) >= 3)
+        is_short = len(s) < 60 and (s.endswith(':') or re.match(r'^\d+(\.\d+)*\s', s))
+        if is_allcaps or is_short:
             headings.append((pos, s))
-
         pos += len(line) + 1
     return headings
 
-def find_sections(pages: List[str], toc: Optional[List[Dict]] = None) -> List[Dict]:
-    sections = []
-    if toc:
-        for i, entry in enumerate(toc):
-            start_page = entry['page'] - 1
-            end_page = toc[i+1]['page'] - 1 if i + 1 < len(toc) else len(pages)
-            sections.append({
-                "title": entry['title'],
-                "start_page": start_page,
-                "end_page": end_page,
-                "text": "\n".join(pages[start_page:end_page])
-            })
-        return sections
-    # Fallback to heading-based section detection
-    for i, page_text in enumerate(pages):
-        headings = detect_headings_in_page(page_text)
-        if headings:
-            # Simple approach: assume first heading is the section title
-            sections.append({
-                "title": headings[0][1],
-                "start_page": i,
-                "end_page": i + 1,
-                "text": page_text
-            })
-        else:
-            # If no headings, treat the whole page as a section
-            sections.append({
-                "title": f"Page {i+1}",
-                "start_page": i,
-                "end_page": i + 1,
-                "text": page_text
-            })
-    return sections
-
-def chunk_document_pages(pages: List[str], doc_meta: Dict, toc: Optional[List[Dict]] = None) -> Tuple[List[str], List[Dict]]:
-    sections = find_sections(pages, toc)
-    final_chunks = []
-    metadatas = []
+def chunk_document_pages(pages: List[str], doc_meta: Dict) -> List[Document]:
+    page_marker_texts = [f"[Page {i+1}]\n{p}" for i, p in enumerate(pages)]
+    full_text = "\n\n".join(page_marker_texts)
+    headings = detect_headings_in_page(full_text)
+    chunks = []
+    if headings:
+        for start, heading in headings:
+            end = full_text.find('\n\n', start + len(heading) + 10)
+            chunk = full_text[start:end] if end > 0 else full_text[start:]
+            if chunk.strip():
+                chunks.append(chunk)
+    else:
+        chunks = [s.strip() for s in re.split(r'\n\s*\n', full_text) if s.strip()]
     splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
-
-    for i, section in enumerate(sections):
-        # Split section text into paragraphs
-        paragraphs = re.split(r'\n\s*\n', section['text'])
-        for j, p_text in enumerate(paragraphs):
-            if len(p_text.strip()) < 50:  # Skip very short paragraphs
-                continue
-
-            # Further split large paragraphs
-            if len(p_text) > 1200:
-                sub_chunks = splitter.split_text(p_text)
-                for k, sub_chunk in enumerate(sub_chunks):
-                    final_chunks.append(sub_chunk)
-                    metadatas.append({
-                        "doc_id": doc_meta["doc_id"],
-                        "page": section["start_page"] + 1,  # Approximate page
-                        "section_title": section["title"],
-                        "paragraph": j + 1,
-                        "source": doc_meta["file_name"]
-                    })
-            else:
-                final_chunks.append(p_text)
-                metadatas.append({
-                    "doc_id": doc_meta["doc_id"],
-                    "page": section["start_page"] + 1,  # Approximate page
-                    "section_title": section["title"],
-                    "paragraph": j + 1,
-                    "source": doc_meta["file_name"]
-                })
-    return final_chunks, metadatas
+    final_chunks = []
+    for i, c in enumerate(chunks):
+        if len(c) < 1200:
+            final_chunks.append(Document(page_content=c, metadata={"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]}))
+            m = re.search(r'\[Page (\d+)\]', c)
+            if m:
+                final_chunks[-1].metadata["page"] = int(m.group(1))
+        else:
+            sub = splitter.split_text(c)
+            for j, s in enumerate(sub):
+                doc = Document(page_content=s, metadata={"doc_id": doc_meta["doc_id"], "page": None, "section_title": "", "paragraph": i+1, "source": doc_meta["file_name"]})
+                m = re.search(r'\[Page (\d+)\]', s)
+                if m:
+                    doc.metadata["page"] = int(m.group(1))
+                final_chunks.append(doc)
+    return final_chunks
 
 QA_PROMPT = """You are an accurate document question-answering assistant.
+
 Use ONLY the provided context to answer the question. Provide bullet points and cite every claim as:
+
 (Document ID: [ID], Page: [X], Section: [Y], Source: [Source]).
+
 If the answer cannot be found in the context, respond EXACTLY: "Answer is not available in the context."
+
 Context:
+
 {context}
+
 Question:
+
 {question}
+
 Answer:
 """
 
 def ask_groq_with_docs(docs, question, model_name="llama3-70b-8192", temperature=0.2, groq_api_key=None):
     parts = []
     for d in docs:
-        content = d.get("page_content", "")
-        meta = d.get("metadata", {})
+        content = d.page_content
+        meta = d.metadata
         header = f"(Document ID: {meta.get('doc_id','NA')}, Page: {meta.get('page','NA')}, Section: {meta.get('section_title','NA')}, Source: {meta.get('source','NA')})"
         snippet = content[:1900] + "..." if len(content) > 1900 else content
         parts.append(header + "\n" + snippet)
@@ -553,46 +408,14 @@ def ask_groq_with_docs(docs, question, model_name="llama3-70b-8192", temperature
     except Exception as e:
         return f"LLM error: {e}"
 
-def load_benchmarks(db):
-    coll = get_collection(db, "benchmarks")
-    if coll and coll.count_documents({}) > 0:
-        return coll.find_one({}, {"_id": 0}) or {}
-    return {"ingestion_times": [], "query_times": [], "extraction_accuracy": []}
-
-def save_benchmarks(db, bench: Dict):
-    coll = get_collection(db, "benchmarks")
-    if coll:
-        coll.replace_one({}, bench, upsert=True)
-
 # ==============================================================================
-# UI: ROLE-BASED ACCESS CONTROL
+# SIMPLIFIED UI PAGES
 # ==============================================================================
-def show_user_panel():
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("👤 User Role & Access")
-    role_options = ['viewer', 'editor', 'admin']
-    st.session_state.user_role = st.sidebar.selectbox(
-        "Select Role",
-        role_options,
-        index=role_options.index(st.session_state.user_role),
-        help="Viewer = read-only, Editor = upload/edit, Admin = full control."
-    )
-    st.sidebar.markdown(f"**🧭 Current Role:** `{st.session_state.user_role.upper()}`")
 
-def check_permission(required_role: str) -> bool:
-    roles = {'viewer': 1, 'editor': 2, 'admin': 3}
-    return roles.get(st.session_state.user_role, 0) >= roles.get(required_role, 0)
-
-# ==============================================================================
-# PAGES
-# ==============================================================================
 def page_dashboard():
     st.markdown('<h2 class="section-title">📊 Dashboard</h2>', unsafe_allow_html=True)
-    db = st.session_state.db
-    docs = load_documents_from_mongo(db)
-    benchmarks = load_benchmarks(db)
-
-    col1, col2, col3, col4, col5 = st.columns(5)
+    docs = load_documents()
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.markdown('<div class="metric">', unsafe_allow_html=True)
         st.metric("Total Documents", len(docs))
@@ -603,33 +426,25 @@ def page_dashboard():
         st.metric("Total Pages", total_pages)
         st.markdown('</div>', unsafe_allow_html=True)
     with col3:
-        total_tables = sum(d.get('tables', 0) for d in docs)
+        total_tables = len(load_json_file(TABLES_FILE))
         st.markdown('<div class="metric">', unsafe_allow_html=True)
         st.metric("Total Tables", total_tables)
         st.markdown('</div>', unsafe_allow_html=True)
     with col4:
-        total_images = sum(d.get('images', 0) for d in docs)
+        total_images = len(load_json_file(IMAGES_FILE))
         st.markdown('<div class="metric">', unsafe_allow_html=True)
         st.metric("Total Images", total_images)
         st.markdown('</div>', unsafe_allow_html=True)
-    with col5:
-        avg_time = sum(benchmarks.get('ingestion_times', [])) / len(benchmarks.get('ingestion_times', [])) if benchmarks.get('ingestion_times') else 0
-        st.markdown('<div class="metric">', unsafe_allow_html=True)
-        st.metric("Avg Ingest Time", f"{avg_time:.2f}s")
-        st.markdown('</div>', unsafe_allow_html=True)
-
     st.markdown("### Recent Uploads")
     if docs:
         recent = sorted(docs, key=lambda x: x.get('uploaded_at', 0), reverse=True)[:5]
         for doc in recent:
-            col1, col2, col3 = st.columns([2, 1, 1])
+            col1, col2 = st.columns([3, 1])
             with col1:
                 status = doc.get('status', 'processed')
                 badge_class = "status-success" if status == "processed" else "status-warning" if status == "processing" else "status-error"
                 st.markdown(f'<span class="status-badge {badge_class}">{status.upper()}</span> {doc["file_name"]}', unsafe_allow_html=True)
             with col2:
-                st.caption(f"Pages: {doc.get('pages', 'N/A')}")
-            with col3:
                 ts = datetime.fromtimestamp(doc.get('uploaded_at', 0)).strftime('%m/%d')
                 st.caption(ts)
     else:
@@ -637,22 +452,13 @@ def page_dashboard():
 
 def page_upload():
     st.markdown('<h2 class="section-title">📤 Upload & Ingest PDFs</h2>', unsafe_allow_html=True)
-
-    if not check_permission('editor'):
-        st.error("❌ You need editor permissions to upload documents.")
-        return
-
-    db = st.session_state.db
-    pdf_bucket = get_bucket(db, BUCKETS["pdfs"])
     col1, col2 = st.columns([2, 1])
     with col1:
         department = st.text_input("📁 Department / Tag (optional)", placeholder="e.g., Finance, HR")
     with col2:
         language = st.selectbox("🌐 Language", ["en", "other"])
         use_ocr = st.checkbox("Use OCR for scanned PDFs", value=True)
-
     uploaded_files = st.file_uploader("📎 Upload PDF files", type=["pdf"], accept_multiple_files=True)
-
     if st.button("🚀 Ingest Selected Files", type="primary"):
         if not uploaded_files:
             st.warning("Please select PDFs to upload.")
@@ -660,49 +466,48 @@ def page_upload():
             progress_bar = st.progress(0)
             status_text = st.empty()
             total = len(uploaded_files)
-            benchmarks = load_benchmarks(db)
-
             for count, f in enumerate(uploaded_files):
                 start_time = time.time()
                 status_text.text(f"Processing {f.name}... ({count+1}/{total})")
-
                 try:
                     raw = f.read()
                     doc_id = make_doc_id()
                     fname = f"{doc_id}_{f.name}"
-                    metadata = {"doc_id": doc_id, "file_name": fname}
-                    blob_id = save_blob(db, BUCKETS["pdfs"], fname, raw, metadata)
-
-                    # Update status
+                    pdf_path = save_pdf_local(doc_id, raw, fname)
+                    metadata = {"department": department, "language": language}
                     doc_meta = {
                         "doc_id": doc_id,
                         "file_name": fname,
-                        "blob_id": blob_id,
-                        "uploaded_by": st.session_state.user_role,
+                        "pdf_path": pdf_path,
+                        "uploaded_by": "user",
                         "uploaded_at": time.time(),
                         "pages": 0,
                         "toc": [],
                         "status": "processing",
-                        "metadata": {"department": department, "language": language}
+                        "metadata": metadata
                     }
-                    save_document_to_mongo(db, doc_meta)
-                    audit_log("UPLOAD_START", f"Started {f.name} (ID: {doc_id})")
-
+                    save_document(doc_meta)
                     pages, toc = extract_text_pdf(raw, use_ocr_if_empty=use_ocr)
                     tables = extract_tables_pdf(raw)
-                    images = extract_images_pdf(raw, doc_id, db)
-
+                    images = extract_images_pdf(raw, doc_id)
                     extraction_time = time.time() - start_time
-
-                    # Chunk and embed with Milvus
+                    # Chunk and embed
                     chunk_start = time.time()
-                    chunks, ch_meta = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname}, toc)
-                    milvus_coll = st.session_state.milvus_coll
-                    if milvus_coll:
-                        build_or_load_milvus(chunks, ch_meta, milvus_coll)
+                    chunks_docs = chunk_document_pages(pages, {"doc_id": doc_id, "file_name": fname})
+                    build_or_load_faiss(chunks_docs)
                     embedding_time = time.time() - chunk_start
-
-                    # Save to Mongo
+                    # Save tables and images
+                    tables_all = load_json_file(TABLES_FILE)
+                    for t in tables:
+                        t["doc_id"] = doc_id
+                        tables_all.append(t)
+                    save_json_file(TABLES_FILE, tables_all)
+                    images_all = load_json_file(IMAGES_FILE)
+                    for img in images:
+                        img["doc_id"] = doc_id
+                        images_all.append(img)
+                    save_json_file(IMAGES_FILE, images_all)
+                    # Update doc meta
                     doc_meta.update({
                         "pages": len(pages),
                         "toc": toc,
@@ -712,61 +517,24 @@ def page_upload():
                         "extraction_time": extraction_time,
                         "embedding_time": embedding_time
                     })
-                    update_document_in_mongo(db, doc_id, doc_meta)
-
-                    # Save chunks, tables, images metadata
-                    chunks_coll = get_collection(db, "chunks")
-                    if chunks_coll:
-                        for i, (chunk, meta) in enumerate(zip(chunks, ch_meta)):
-                            chunks_coll.insert_one({"_id": f"chunk_{doc_id}_{i}", **meta, "text": chunk})
-
-                    tables_coll = get_collection(db, "tables")
-                    if tables_coll and tables:
-                        for t in tables:
-                            t["doc_id"] = doc_id
-                            tables_coll.insert_one(t)
-
-                    images_coll = get_collection(db, "images")
-                    if images_coll and images:
-                        for img in images:
-                            img["doc_id"] = doc_id
-                            images_coll.insert_one(img)
-
-                    # Benchmarks
-                    benchmarks["ingestion_times"].append(extraction_time + embedding_time)
-                    save_benchmarks(db, benchmarks)
-
-                    audit_log("UPLOAD_SUCCESS", f"Completed {f.name} (ID: {doc_id})")
+                    update_document(doc_id, doc_meta)
                     st.success(f"✅ Ingested {f.name}")
-
                 except Exception as e:
                     error_msg = str(e)
-                    update_document_in_mongo(db, doc_id, {"status": "error", "error": error_msg})
+                    update_document(doc_id, {"status": "error", "error": error_msg})
                     st.error(f"❌ Failed to process {f.name}: {error_msg}")
-                    audit_log("UPLOAD_ERROR", f"Failed {f.name}: {error_msg}")
-
                 progress_bar.progress((count + 1) / total)
-
             status_text.empty()
             progress_bar.empty()
             st.balloons()
 
 def page_documents():
     st.markdown('<h2 class="section-title">📚 Documents</h2>', unsafe_allow_html=True)
-    db = st.session_state.db
-    docs = load_documents_from_mongo(db)
-
+    docs = load_documents()
     if not docs:
         st.info("No documents ingested yet.")
         return
-
-    departments = set(d.get('metadata', {}).get('department', '') for d in docs)
-    selected_dept = st.selectbox("Filter by department", ["All"] + sorted(list(departments)))
-
     for doc in sorted(docs, key=lambda x: x.get('uploaded_at', 0), reverse=True):
-        if selected_dept != "All" and doc.get('metadata', {}).get('department') != selected_dept:
-            continue
-
         with st.expander(f"📄 {doc['file_name']} ({doc['doc_id']}) - Status: {doc.get('status', 'unknown')}", expanded=False):
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -775,120 +543,36 @@ def page_documents():
                 st.metric("📊 Tables", doc.get('tables', 0))
             with col3:
                 st.metric("🖼️ Images", doc.get('images', 0))
-
             st.caption(f"⏰ Uploaded: {datetime.fromtimestamp(doc.get('uploaded_at', 0)).strftime('%Y-%m-%d %H:%M:%S')}")
-
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 if st.button("👁️ View", key=f"view_{doc['doc_id']}"):
                     st.session_state.selected_doc = doc['doc_id']
             with col2:
-                if check_permission('editor') and st.button("✏️ Edit Metadata", key=f"edit_{doc['doc_id']}"):
-                    edit_doc_metadata(doc)
-            with col3:
-                if check_permission('editor') and st.button("🔄 Reprocess", key=f"reprocess_{doc['doc_id']}"):
-                    reprocess_document(doc['doc_id'])
-            with col4:
-                if check_permission('admin') and st.button("🗑️ Delete", key=f"delete_{doc['doc_id']}"):
+                if st.button("🗑️ Delete", key=f"delete_{doc['doc_id']}"):
                     delete_document(doc['doc_id'])
                     st.rerun()
-
-            # Download PDF from Mongo
-            pdf_bucket = get_bucket(db, BUCKETS["pdfs"])
-            if pdf_bucket and doc.get('blob_id'):
-                pdf_bytes = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
-                if pdf_bytes:
-                    st.download_button(
-                        "📥 Download PDF",
-                        pdf_bytes,
-                        file_name=doc['file_name'],
-                        key=f"dl_{doc['doc_id']}"
-                    )
-
-def edit_doc_metadata(doc):
-    with st.form(key=f"edit_form_{doc['doc_id']}"):
-        department = st.text_input("Department", value=doc.get('metadata', {}).get('department', ''))
-        tags = st.text_area("Tags (comma-separated)", value=','.join(doc.get('metadata', {}).get('tags', [])))
-        if st.form_submit_button("Save"):
-            updates = {"metadata": {"department": department, "tags": [t.strip() for t in tags.split(',') if t.strip()], "language": doc.get('metadata', {}).get('language', 'en')}}
-            update_document_in_mongo(st.session_state.db, doc['doc_id'], updates)
-            audit_log("METADATA_EDIT", f"Edited metadata for {doc['doc_id']}")
-            st.success("Metadata updated!")
-            st.rerun()
-
-def reprocess_document(doc_id):
-    st.info(f"Reprocessing document: {doc_id}")
-    db = st.session_state.db
-    doc_coll = get_collection(db, "documents")
-    doc = doc_coll.find_one({"doc_id": doc_id})
-
-    if not doc or not doc.get('blob_id'):
-        st.error("Document data or PDF blob not found.")
-        return
-
-    # 1. Delete existing data from Milvus and Mongo collections
-    milvus_coll = st.session_state.milvus_coll
-    if milvus_coll:
-        milvus_coll.delete(f"doc_id == '{doc_id}'")
-
-    for coll_name in ["chunks", "tables", "images"]:
-        coll = get_collection(db, coll_name)
-        if coll:
-            coll.delete_many({"doc_id": doc_id})
-
-    # 2. Re-run the ingestion pipeline
-    try:
-        raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
-        if not raw:
-            st.error("Failed to load PDF from GridFS.")
-            return
-
-        pages, toc = extract_text_pdf(raw, use_ocr_if_empty=True)
-        tables = extract_tables_pdf(raw)
-        images = extract_images_pdf(raw, doc_id, db)
-        chunks, ch_meta = chunk_document_pages(pages, doc, toc)
-
-        if milvus_coll:
-            build_or_load_milvus(chunks, ch_meta, milvus_coll)
-
-        # 3. Update document metadata
-        updates = {
-            "pages": len(pages),
-            "toc": toc,
-            "tables": len(tables),
-            "images": len(images),
-            "status": "reprocessed",
-            "processed_at": time.time()
-        }
-        update_document_in_mongo(db, doc_id, updates)
-
-        audit_log("REPROCESS_SUCCESS", f"Successfully reprocessed {doc_id}")
-        st.success("✅ Document reprocessed successfully!")
-        st.rerun()
-
-    except Exception as e:
-        update_document_in_mongo(db, doc_id, {"status": "reprocess_error", "error": str(e)})
-        st.error(f"❌ Reprocessing failed: {e}")
-        audit_log("REPROCESS_ERROR", f"Failed to reprocess {doc_id}: {e}")
-
-def delete_document(doc_id):
-    db = st.session_state.db
-    delete_document_from_mongo(db, doc_id)
-    audit_log("DELETE", f"Deleted {doc_id}")
-    st.success("Document deleted!")
+            with col3:
+                if doc.get('pdf_path'):
+                    pdf_bytes = load_pdf_local(doc['pdf_path'])
+                    if pdf_bytes:
+                        st.download_button(
+                            "📥 Download PDF",
+                            pdf_bytes,
+                            file_name=doc['file_name'],
+                            key=f"dl_{doc['doc_id']}"
+                        )
 
 @st.cache_data
-def load_document_view(doc_id):
-    db = st.session_state.db
-    doc = next((d for d in load_documents_from_mongo(db) if d['doc_id'] == doc_id), None)
-    if not doc:
-        return None
-    pdf_bucket = get_bucket(db, BUCKETS["pdfs"])
-    if pdf_bucket and doc.get('blob_id'):
-        raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
-        if raw:
-            pages, _ = extract_text_pdf(raw)
-            return pages, doc
+def load_document_view(doc_id: str):
+    docs = load_documents()
+    doc = next((d for d in docs if d['doc_id'] == doc_id), None)
+    if not doc or not doc.get('pdf_path'):
+        return None, None
+    raw = load_pdf_local(doc['pdf_path'])
+    if raw:
+        pages, _ = extract_text_pdf(raw)
+        return pages, doc
     return None, None
 
 def page_document_viewer():
@@ -907,114 +591,64 @@ def page_document_viewer():
 
 def page_tables():
     st.markdown('<h2 class="section-title">📊 Tables</h2>', unsafe_allow_html=True)
-    db = st.session_state.db
-    tables_coll = get_collection(db, "tables")
-    if tables_coll:
-        tables = list(tables_coll.find({}, {"_id": 0}))
-    else:
-        tables = []
-
+    tables = load_json_file(TABLES_FILE)
     if not tables:
         st.info("No tables extracted yet.")
         return
-
-    docs = load_documents_from_mongo(db)
+    docs = load_documents()
     doc_choices = {d['file_name']: d['doc_id'] for d in docs}
     selected_doc_name = st.selectbox("Select Document", ["All"] + list(doc_choices.keys()))
-
     for t in tables:
         doc_id = t['doc_id']
         if selected_doc_name != "All" and doc_choices.get(selected_doc_name) != doc_id:
             continue
-
         with st.expander(f"📊 Table (Page {t['page']}) - Doc: {doc_id}", expanded=False):
             df = pd.DataFrame(t["rows"])
-
-            if check_permission('editor'):
-                edited_df = st.data_editor(df, use_container_width=True, key=f"table_{t.get('_id', uuid.uuid4())}")
-                if st.button("💾 Save Changes", key=f"save_table_{t.get('_id', uuid.uuid4())}"):
-                    t["rows"] = edited_df.to_dict(orient='records')
-                    tables_coll.update_one({"doc_id": doc_id, "page": t['page']}, {"$set": t})
-                    audit_log("TABLE_EDIT", f"Edited table in {doc_id}")
-                    st.success("✅ Table updated")
-            else:
-                st.dataframe(df, use_container_width=True)
-
+            st.dataframe(df, use_container_width=True)
             csv = df.to_csv(index=False)
             st.download_button("📥 Download CSV", csv, file_name=f"table_page_{t['page']}.csv")
 
 def page_images():
     st.markdown('<h2 class="section-title">🖼️ Images Gallery</h2>', unsafe_allow_html=True)
-    db = st.session_state.db
-    images_coll = get_collection(db, "images")
-    if images_coll:
-        images = list(images_coll.find({}, {"_id": 0}))
-    else:
-        images = []
-
+    images = load_json_file(IMAGES_FILE)
     if not images:
         st.info("No images extracted yet.")
         return
-
     cols = st.columns(3)
-    img_bucket = get_bucket(db, BUCKETS["images"])
     for i, img in enumerate(images):
         with cols[i % 3]:
             try:
-                if img_bucket and img.get('blob_id'):
-                    img_bytes = load_blob(db, BUCKETS["images"], img['blob_id'])
+                if img.get('img_path'):
+                    img_bytes = load_image_local(img['img_path'])
                     if img_bytes:
                         img_pil = Image.open(BytesIO(img_bytes))
                         st.image(img_pil, use_column_width=True)
-                        caption_key = f"caption_{img['id']}"
-                        if caption_key not in st.session_state:
-                            st.session_state[caption_key] = img.get('caption', 'Untitled')
-
-                        new_caption = st.text_input("Caption", value=st.session_state[caption_key], key=caption_key)
-                        if st.button("Update Caption", key=f"update_cap_{img['id']}"):
-                            st.session_state[caption_key] = new_caption
-                            images_coll.update_one({"id": img['id']}, {"$set": {"caption": new_caption}})
-                            audit_log("IMAGE_CAPTION_EDIT", f"Updated caption for {img['id']}")
-                            st.success("Caption updated!")
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.caption(f"Page: {img['page']}")
-                        with col2:
-                            st.download_button("⬇️", img_bytes, file_name=f"img_{img['id']}.png", key=f"dl_img_{img['id']}")
+                        st.caption(img.get('caption', 'Untitled'))
+                        st.caption(f"Page: {img['page']}")
+                        st.download_button("⬇️", img_bytes, file_name=f"img_{img['id']}.png", key=f"dl_img_{img['id']}")
             except Exception as e:
                 st.error(f"Failed to load image: {e}")
 
 def page_search():
     st.markdown('<h2 class="section-title">🔍 Search & Q&A</h2>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([3, 1])
     with col1:
         query = st.text_input("🔎 Enter your search query", placeholder="Ask anything...")
     with col2:
         k = st.slider("Top K Results", 1, 15, 5)
-
     tab1, tab2 = st.tabs(["🔍 Search", "🤖 Q&A with RAG"])
-
     with tab1:
         if st.button("Search", type="primary"):
             if not query.strip():
                 st.warning("Enter a query.")
             else:
                 try:
-                    milvus_coll = st.session_state.milvus_coll
-                    if milvus_coll:
-                        docs = search_milvus(query, k, milvus_coll)
-                    else:
-                        docs = []
+                    docs = search_faiss(query, k=k)
                     st.session_state.search_results = docs
-
-                    audit_log("SEARCH", f"Query: {query}")
-
                     st.success(f"Found {len(docs)} results")
                     for i, d in enumerate(docs):
-                        md = d.get("metadata", {})
-                        snippet = postprocess_extracted_text(d.get("page_content", ""))[:500]
+                        md = d.metadata
+                        snippet = postprocess_extracted_text(d.page_content)[:500]
                         with st.expander(f"📄 Result {i+1}: {md.get('source')} (Page {md.get('page')})"):
                             st.write(snippet)
                             col1, col2 = st.columns(2)
@@ -1022,10 +656,8 @@ def page_search():
                                 st.caption(f"Doc ID: {md.get('doc_id')}")
                             with col2:
                                 st.caption(f"Section: {md.get('section_title', 'N/A')}")
-
                 except Exception as e:
                     st.error(f"Search failed: {e}")
-
     with tab2:
         if st.button("Get Answer (RAG)", type="primary"):
             if not query.strip():
@@ -1034,154 +666,38 @@ def page_search():
                 st.error("❌ Set Groq API key in sidebar.")
             else:
                 try:
-                    milvus_coll = st.session_state.milvus_coll
-                    if milvus_coll:
-                        docs = search_milvus(query, k, milvus_coll)
-                    else:
-                        docs = []
-
+                    docs = search_faiss(query, k=k)
                     with st.spinner("🤔 Thinking..."):
-                        start_q = time.time()
                         ans = ask_groq_with_docs(docs, query, groq_api_key=os.environ.get("GROQ_API_KEY"))
-                        q_time = time.time() - start_q
-                        benchmarks = load_benchmarks(st.session_state.db)
-                        benchmarks["query_times"].append(q_time)
-                        save_benchmarks(st.session_state.db, benchmarks)
-
-                    audit_log("QA", f"Query: {query}")
-
                     st.markdown("### 📝 Answer")
                     st.markdown(ans)
-
                     citations = re.findall(r'\(Document ID: \[([^\]]+)\], Page: \[([^\]]+)\]', ans)
                     with st.expander("📚 Sources"):
                         for cit in citations:
                             st.markdown(f'<div class="citation">Doc ID: {cit[0]}, Page: {cit[1]}</div>', unsafe_allow_html=True)
-
                 except Exception as e:
                     st.error(f"QA failed: {e}")
 
-def page_benchmarks():
-    st.markdown('<h2 class="section-title">📈 Performance Benchmarks</h2>', unsafe_allow_html=True)
-    db = st.session_state.db
-    benchmarks = load_benchmarks(db)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        avg_ingest = sum(benchmarks.get('ingestion_times', [])) / len(benchmarks.get('ingestion_times', [])) if benchmarks.get('ingestion_times') else 0
-        st.metric("Avg Ingestion Time", f"{avg_ingest:.2f}s")
-    with col2:
-        avg_query = sum(benchmarks.get('query_times', [])) / len(benchmarks.get('query_times', [])) if benchmarks.get('query_times') else 0
-        st.metric("Avg Query Time", f"{avg_query:.2f}s")
-    with col3:
-        avg_acc = sum(benchmarks.get('extraction_accuracy', [])) / len(benchmarks.get('extraction_accuracy', [])) if benchmarks.get('extraction_accuracy') else 0
-        st.metric("Extraction Accuracy", f"{avg_acc:.1%}")
-
-    if benchmarks.get('ingestion_times'):
-        st.line_chart({"Ingestion Times": benchmarks['ingestion_times']})
-
-def page_admin():
-    st.markdown('<h2 class="section-title">⚙️ Admin Panel</h2>', unsafe_allow_html=True)
-
-    if not check_permission('admin'):
-        st.error("❌ Admin permissions required.")
-        return
-
-    tab1, tab2, tab3, tab4 = st.tabs(["🔧 Management", "📈 Benchmarks", "🔐 Audit Log", "📥 Backup"])
-
-    with tab1:
-        st.subheader("System Management")
-        if st.button("🔄 Rebuild Milvus Index"):
-            with st.spinner("Rebuilding index in batches... This may take a while."):
-                db = st.session_state.db
-                docs = load_documents_from_mongo(db)
-
-                milvus_coll = create_milvus_collection()
-                if milvus_coll:
-                    milvus_coll.drop()  # Clear the old collection
-                    st.session_state.milvus_coll = create_milvus_collection() # Recreate it
-
-                batch_size = 5
-                for i in range(0, len(docs), batch_size):
-                    batch_docs = docs[i:i+batch_size]
-                    all_chunks, all_meta = [], []
-                    st.write(f"Processing batch {i//batch_size + 1}...")
-                    for doc in batch_docs:
-                        if doc.get('blob_id'):
-                            raw = load_blob(db, BUCKETS["pdfs"], doc['blob_id'])
-                            if raw:
-                                pages, toc = extract_text_pdf(raw)
-                                chunks, ch_meta = chunk_document_pages(pages, doc, toc)
-                                all_chunks.extend(chunks)
-                                all_meta.extend(ch_meta)
-
-                    if all_chunks:
-                        build_or_load_milvus(all_chunks, all_meta, st.session_state.milvus_coll)
-
-                st.success("✅ Milvus index rebuilt successfully!")
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Docs in Mongo", len(load_documents_from_mongo(st.session_state.db)))
-        with col2:
-            st.metric("Tables in Mongo", get_collection(st.session_state.db, "tables").count_documents({}) if get_collection(st.session_state.db, "tables") else 0)
-        with col3:
-            st.metric("Vectors in Milvus", st.session_state.milvus_coll.num_entities if st.session_state.milvus_coll else 0)
-
-    with tab2:
-        page_benchmarks()
-
-    with tab3:
-        st.subheader("Audit Log")
-        # Simulate log display (in production, fetch from Mongo audit collection)
-        st.info("Audit logs would be fetched from MongoDB collection.")
-
-    with tab4:
-        st.subheader("Backup & Export")
-        if st.button("📦 Export Mongo Data (JSON)"):
-            db = st.session_state.db
-            if db:
-                export_data = {}
-                for coll_name in COLLECTIONS.values():
-                    coll = db[coll_name]
-                    export_data[coll_name] = list(coll.find({}, {"_id": 0}))
-                st.download_button("📥 Download JSON Export", json.dumps(export_data, indent=2).encode(), "mongo_export.json")
-
 # ==============================================================================
-# MAIN APP
+# MAIN APP (Simplified)
 # ==============================================================================
+
 def main():
     st.sidebar.title("📚 Enterprise PDF → Knowledge")
-    st.sidebar.markdown("Using MongoDB + Milvus only (no local files)")
-
+    st.sidebar.markdown("Simplified: Local files + FAISS")
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧭 Navigation")
     page = st.sidebar.radio(
         "Select Page",
-        ["Dashboard", "Upload & Ingest", "Documents", "Document Viewer", "Tables", "Images", "Search & Q&A", "Benchmarks", "Admin"]
+        ["Dashboard", "Upload & Ingest", "Documents", "Document Viewer", "Tables", "Images", "Search & Q&A"]
     )
-
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚙️ Configuration")
     groq_key = st.sidebar.text_input("Groq API Key", type="password", placeholder="sk-...")
     if groq_key:
         os.environ["GROQ_API_KEY"] = groq_key
         st.sidebar.caption("✅ Set")
-    mongo_uri = st.sidebar.text_input("Mongo URI", value=MONGO_URI, type="password")
-    if mongo_uri != MONGO_URI:
-        os.environ["MONGO_URI"] = mongo_uri
-        st.session_state.db = get_mongo_client()
-        st.sidebar.caption("🔄 Reconnected")
-    milvus_uri = st.sidebar.text_input("Milvus URI", value=MILVUS_URI, type="password")
-    if milvus_uri != MILVUS_URI:
-        os.environ["MILVUS_URI"] = milvus_uri
-        st.session_state.milvus_coll = create_milvus_collection()
-        st.sidebar.caption("🔄 Reconnected")
-
-    show_user_panel()
-
     st.markdown('<h1 class="main-header">📚 Enterprise PDF → Knowledge Hub</h1>', unsafe_allow_html=True)
-
     if page == "Dashboard":
         page_dashboard()
     elif page == "Upload & Ingest":
@@ -1196,13 +712,8 @@ def main():
         page_images()
     elif page == "Search & Q&A":
         page_search()
-    elif page == "Benchmarks":
-        page_benchmarks()
-    elif page == "Admin":
-        page_admin()
-
     st.markdown("---")
-    st.markdown('<div style="text-align: center; color: #888;">Built with ❤️ | MongoDB (Blobs + Metadata) + Milvus + OCR + Tables + RAG</div>', unsafe_allow_html=True)
+    st.markdown('<div style="text-align: center; color: #888;">Simplified with ❤️ | Local Storage + FAISS + OCR + Tables + RAG</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
