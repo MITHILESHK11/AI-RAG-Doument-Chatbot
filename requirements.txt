@@ -1,17 +1,42 @@
+# Core Python utilities
+os
+re
+json
+time
+traceback
+hashlib
+io
+pathlib
+typing
+datetime
+zipfile
+uuid
+logging
+
+# Streamlit app framework
 streamlit
+
+# PDF and document processing
 pdfplumber
 PyPDF2
+fitz
 pymupdf
-pillow
+Pillow
 pytesseract
 opencv-python
 numpy
-pandas
 beautifulsoup4
+
+# Machine Learning / NLP / Embeddings
 langchain
+langchain-core
 langchain-huggingface
-langchain-community
+langchain-text-splitters
 langchain-groq
-faiss-cpu
-sentence-transformers
-python-dotenv
+pandas
+
+# Databases
+pymongo
+pymilvus
+
+# Optional visualization / debugging tools
