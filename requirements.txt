@@ -25,3 +25,4 @@ python-dotenv
 gradio
 google-generativeai
 uuid
+pyaudioop 
