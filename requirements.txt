@@ -1,28 +1,66 @@
+# ---------------------------------------
+# CORE DEPENDENCIES
+# ---------------------------------------
 streamlit
+gradio
+python-dotenv
+uuid
+tqdm
+regex
+
+# ---------------------------------------
+# PDF, OCR, AND IMAGE PROCESSING
+# ---------------------------------------
 pdfplumber
 PyPDF2
 PyMuPDF
 Pillow
 pytesseract
 opencv-python-headless
-numpy
-pandas
-beautifulsoup4
-langchain
-langchain-huggingface
-langchain-community
-langchain-groq
-sentence-transformers
-pymilvus
-pymongo
-faiss-cpu
 unstructured[all-docs]
 lxml
-chromadb
-tiktoken
-langchain-google-genai
-python-dotenv
-gradio
-google-generativeai
-uuid
+beautifulsoup4
 
+# ---------------------------------------
+# DATA & NUMPY UTILITIES
+# ---------------------------------------
+numpy
+pandas
+
+# ---------------------------------------
+# LANGCHAIN ECOSYSTEM (Groq + Gemini + HuggingFace)
+# ---------------------------------------
+langchain
+langchain-core
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+langchain-groq
+langchain-google-genai
+langchain-openai    # for compatibility (some LangChain utils depend on this)
+
+# ---------------------------------------
+# EMBEDDINGS & VECTOR DATABASES
+# ---------------------------------------
+sentence-transformers
+faiss-cpu
+chromadb
+pymilvus
+pymongo
+
+# ---------------------------------------
+# TOKENIZATION / UTILITIES
+# ---------------------------------------
+tiktoken
+
+# ---------------------------------------
+# GOOGLE GEMINI API
+# ---------------------------------------
+google-generativeai
+
+# ---------------------------------------
+# OPTIONAL UTILITIES
+# ---------------------------------------
+requests
+fastapi
+uvicorn
