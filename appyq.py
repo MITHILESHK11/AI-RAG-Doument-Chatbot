@@ -37,7 +37,8 @@ from PIL import Image
 # Vectorstore and embeddings
 # ✅ Correct imports for LangChain 0.2+
 from langchain_community.vectorstores import Chroma
-from langchain_groq import GroqEmbeddings, ChatGroq
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 from langchain_core.documents import Document
 
 # Groq for summarization
@@ -219,7 +220,7 @@ def store_tables_nosql(records: List[Dict]):
 # ---------------------------------------------------------------------------
 
 def init_vectorstore(collection_name: str = "enterprise_pdf"):
-    embeddings = GroqEmbeddings(model="nomic-embed-text", api_key=GROQ_API_KEY)
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vect = Chroma(collection_name=collection_name, embedding_function=embeddings, persist_directory=VECTOR_DIR)
     return vect
 
